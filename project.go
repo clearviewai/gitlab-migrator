@@ -537,28 +537,75 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 	}
 
 	logger.Debug("determining merge request approvers", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
-	approvers := make([]string, 0)
-	awards, _, err := gl.AwardEmoji.ListMergeRequestAwardEmoji(p.project.ID, mergeRequest.IID, &gitlab.ListAwardEmojiOptions{PerPage: 100})
-	if err != nil {
-		sendErr(fmt.Errorf("listing merge request awards: %v", err))
-	} else {
-		for _, award := range awards {
-			if award.Name == "thumbsup" {
-				approver := award.User.Name
 
-				approverUser, err := getGitlabUser(award.User.Username)
+	approvers := make([]string, 0)
+	// First try real approvals
+	approvalState, _, err := gl.MergeRequestApprovals.GetApprovalState(
+		p.project.ID,
+		mergeRequest.IID,
+	)
+	if err != nil {
+		sendErr(fmt.Errorf("getting MR approval state: %v", err))
+	} else if approvalState != nil {
+		// Use a set to avoid duplicates across rules
+		seen := make(map[int]bool) // or map[string]bool keyed by username
+
+		for _, rule := range approvalState.Rules {
+			// rule.ApprovedBy is []*gitlab.BasicUser
+			for _, u := range rule.ApprovedBy {
+				if u == nil {
+					continue
+				}
+
+				// De-dupe by user ID (or username if you prefer)
+				if seen[u.ID] {
+					continue
+				}
+				seen[u.ID] = true
+
+				approver := u.Name
+
+				// Re-use your existing GitLab->GitHub mapping logic
+				approverUser, err := getGitlabUser(u.Username)
 				if err != nil {
 					sendErr(fmt.Errorf("retrieving gitlab user: %v", err))
 					continue
 				}
+
 				if approverUser.WebsiteURL != "" {
-					approver = "@" + strings.TrimPrefix(strings.ToLower(approverUser.WebsiteURL), "https://github.com/")
+					approver = "@" + strings.TrimPrefix(
+						strings.ToLower(approverUser.WebsiteURL),
+						"https://github.com/",
+					)
 				}
 
 				approvers = append(approvers, approver)
 			}
 		}
 	}
+
+	//approvers := make([]string, 0)
+	//awards, _, err := gl.AwardEmoji.ListMergeRequestAwardEmoji(p.project.ID, mergeRequest.IID, &gitlab.ListAwardEmojiOptions{PerPage: 100})
+	//if err != nil {
+	//	sendErr(fmt.Errorf("listing merge request awards: %v", err))
+	//} else {
+	//	for _, award := range awards {
+	//		if award.Name == "thumbsup" {
+	//			approver := award.User.Name
+
+	//			approverUser, err := getGitlabUser(award.User.Username)
+	//			if err != nil {
+	//				sendErr(fmt.Errorf("retrieving gitlab user: %v", err))
+	//				continue
+	//			}
+	//			if approverUser.WebsiteURL != "" {
+	//				approver = "@" + strings.TrimPrefix(strings.ToLower(approverUser.WebsiteURL), "https://github.com/")
+	//			}
+
+	//			approvers = append(approvers, approver)
+	//		}
+	//	}
+	//}
 
 	description := mergeRequest.Description
 	if strings.TrimSpace(description) == "" {
