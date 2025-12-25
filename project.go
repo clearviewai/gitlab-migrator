@@ -592,9 +592,9 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 	author, err := getGitlabUser(mergeRequest.Author.Username)
 	if err == nil {
 		// logger.Trace("GitLab full user for author", "author", author)
-		mergeRequestAuthorStr = fmt.Sprintf("[%s (%s)](mailto:%s)", mergeRequest.Author.Name, mergeRequest.Author.Username, author.Email)
+		mergeRequestAuthorStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", mergeRequest.Author.Name, mergeRequest.Author.Username, author.Email)
 	} else {
-		mergeRequestAuthorStr = fmt.Sprintf("%s (%s)", mergeRequest.Author.Name, mergeRequest.Author.Username)
+		mergeRequestAuthorStr = fmt.Sprintf("%s (@!%s)", mergeRequest.Author.Name, mergeRequest.Author.Username)
 	}
 
 	logger.Debug("determining merge request approvers", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
@@ -628,10 +628,10 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 				// Re-use your existing GitLab->GitHub mapping logic
 				approverUser, err := getGitlabUser(u.Username)
 				if err == nil {
-					logger.Trace("GitLab full user for approver", "approver", approverUser)
-					approverStr = fmt.Sprintf("[%s (%s)](mailto:%s)", u.Name, u.Username, approverUser.Email)
+					// logger.Trace("GitLab full user for approver", "approver", approverUser)
+					approverStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", u.Name, u.Username, approverUser.Email)
 				} else {
-					approverStr = fmt.Sprintf("%s (%s)", u.Name, u.Username)
+					approverStr = fmt.Sprintf("%s (@!%s)", u.Name, u.Username)
 				}
 
 				approvers = append(approvers, approverStr)
@@ -639,30 +639,9 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 		}
 	}
 
-	//approvers := make([]string, 0)
-	//awards, _, err := gl.AwardEmoji.ListMergeRequestAwardEmoji(p.project.ID, mergeRequest.IID, &gitlab.ListAwardEmojiOptions{PerPage: 100})
-	//if err != nil {
-	//	sendErr(fmt.Errorf("listing merge request awards: %v", err))
-	//} else {
-	//	for _, award := range awards {
-	//		if award.Name == "thumbsup" {
-	//			approver := award.User.Name
-
-	//			approverUser, err := getGitlabUser(award.User.Username)
-	//			if err != nil {
-	//				sendErr(fmt.Errorf("retrieving gitlab user: %v", err))
-	//				continue
-	//			}
-	//			if approverUser.WebsiteURL != "" {
-	//				approver = "@" + strings.TrimPrefix(strings.ToLower(approverUser.WebsiteURL), "https://github.com/")
-	//			}
-
-	//			approvers = append(approvers, approver)
-	//		}
-	//	}
-	//}
-
-	description := mergeRequest.Description
+	// this prevents GitLab issue references being confused as GitHub issue/pr references
+	// also prevents on-prem@mentions linked wrongly in the description
+	description := strings.ReplaceAll(strings.ReplaceAll(mergeRequest.Description, "#", "#!"), "@", "@!")
 	if strings.TrimSpace(description) == "" {
 		description = "_No description_"
 	}
@@ -673,11 +652,11 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 		approval = "_No approvers_"
 	}
 
-	closeDate := ""
+	closeDateRow := ""
 	if mergeRequest.State == "closed" && mergeRequest.ClosedAt != nil {
-		closeDate = fmt.Sprintf("\n> | **Date Originally Closed** | %s |", mergeRequest.ClosedAt.Format(dateFormat))
+		closeDateRow = fmt.Sprintf("\n> | **Date Originally Closed** | %s |", mergeRequest.ClosedAt.Format(dateFormat))
 	} else if mergeRequest.State == "merged" && mergeRequest.MergedAt != nil {
-		closeDate = fmt.Sprintf("\n> | **Date Originally Merged** | %s |", mergeRequest.MergedAt.Format(dateFormat))
+		closeDateRow = fmt.Sprintf("\n> | **Date Originally Merged** | %s |", mergeRequest.MergedAt.Format(dateFormat))
 	}
 
 	mergeRequestTitle := mergeRequest.Title
@@ -685,26 +664,33 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 		mergeRequestTitle = mergeRequestTitle[:40] + "..."
 	}
 
-	originalState := ""
+	mergeOrCloseNote := ""
 	if strings.EqualFold(mergeRequest.State, "merged") {
-		shortSHA := mergeRequest.MergeCommitSHA
-		if len(shortSHA) > 7 {
-			shortSHA = shortSHA[:7]
+		if mergeRequest.MergeCommitSHA != "" {
+			shortSHA := mergeRequest.MergeCommitSHA
+			if len(shortSHA) > 7 {
+				shortSHA = shortSHA[:7]
+			}
+			commitStr := fmt.Sprintf("[`%s`](https://%s/%s/%s/commit/%s)", shortSHA, githubDomain, p.githubPath[0], p.githubPath[1], mergeRequest.MergeCommitSHA)
+			mergeOrCloseNote = fmt.Sprintf("> This merge request was originally **merged** on GitLab (merge commit %s).", commitStr)
+		} else if mergeRequest.SquashCommitSHA != "" {
+			shortSHA := mergeRequest.SquashCommitSHA
+			if len(shortSHA) > 7 {
+				shortSHA = shortSHA[:7]
+			}
+			commitStr := fmt.Sprintf("[`%s`](https://%s/%s/%s/commit/%s)", shortSHA, githubDomain, p.githubPath[0], p.githubPath[1], mergeRequest.SquashCommitSHA)
+			mergeOrCloseNote = fmt.Sprintf("> This merge request was originally **merged** on GitLab (squash commit %s).", commitStr)
 		}
-		mergeCommitStr := fmt.Sprintf("[%s](https://github.com/%s/%s/commit/%s)", shortSHA, p.githubPath[0], p.githubPath[1], mergeRequest.MergeCommitSHA)
-		originalState = fmt.Sprintf("> This merge request was originally **%s** on GitLab (merge commit %s).", mergeRequest.State, mergeCommitStr)
 	} else {
-		originalState = fmt.Sprintf("> This merge request was originally **%s** on GitLab.", mergeRequest.State)
+		mergeOrCloseNote = fmt.Sprintf("> This merge request was originally **%s** on GitLab.", mergeRequest.State)
 	}
 
 	body := fmt.Sprintf(`> [!NOTE]
-> This pull request was migrated from GitLab
+> This pull request was migrated from GitLab.
 >
 > |      |      |
 > | ---- | ---- |
 > | **Original Author** | %[1]s |
-> | **GitLab Project** | [%[4]s/%[5]s](https://%[10]s/%[4]s/%[5]s) |
-> | **GitLab Merge Request** | [%[11]s](https://%[10]s/%[4]s/%[5]s/merge_requests/%[2]d) |
 > | **GitLab MR Number** | [%[2]d](https://%[10]s/%[4]s/%[5]s/merge_requests/%[2]d) |
 > | **Date Originally Opened** | %[6]s |%[7]s
 > | **Approved on GitLab by** | %[8]s |
@@ -712,9 +698,7 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 >
 %[9]s
 
-## Original Description
-
-%[3]s`, mergeRequestAuthorStr, mergeRequest.IID, description, p.gitlabPath[0], p.gitlabPath[1], mergeRequest.CreatedAt.Format(dateFormat), closeDate, approval, originalState, gitlabDomain, mergeRequestTitle)
+%[3]s`, mergeRequestAuthorStr, mergeRequest.IID, description, p.gitlabPath[0], p.gitlabPath[1], mergeRequest.CreatedAt.Format(dateFormat), closeDateRow, approval, mergeOrCloseNote, gitlabDomain)
 
 	/*********************************************************
 	* Create or Edit Pull Request
@@ -825,38 +809,51 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 			}
 			commentAuthorStr := ""
 			if comment.Author.Email != "" {
-				commentAuthorStr = fmt.Sprintf("[%s (%s)](mailto:%s)", comment.Author.Name, comment.Author.Username, comment.Author.Email)
+				commentAuthorStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", comment.Author.Name, comment.Author.Username, comment.Author.Email)
 			} else {
 				commentAuthor, err := getGitlabUser(comment.Author.Username)
 				if err == nil {
-					commentAuthorStr = fmt.Sprintf("[%s (%s)](mailto:%s)", comment.Author.Name, comment.Author.Username, commentAuthor.Email)
+					commentAuthorStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", comment.Author.Name, comment.Author.Username, commentAuthor.Email)
 				} else {
-					commentAuthorStr = fmt.Sprintf("%s (%s)", comment.Author.Name, comment.Author.Username)
+					commentAuthorStr = fmt.Sprintf("%s (@!%s)", comment.Author.Name, comment.Author.Username)
+				}
+			}
+
+			glCommentBodyStr := strings.ReplaceAll(strings.ReplaceAll(comment.Body, "#", "#!"), "@", "@!")
+
+			diffNoteRow := ""
+			if comment.Type == "DiffNote" && comment.Position != nil {
+				if comment.Position.OldPath == comment.Position.NewPath {
+					lineNumber := comment.Position.NewLine
+					if lineNumber == 0 && comment.Position.OldLine != 0 {
+						lineNumber = comment.Position.OldLine
+					}
+					diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s:%d` |", comment.Position.OldPath, lineNumber)
+				} else {
+					diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s:%d` -> `%s:%d` |", comment.Position.OldPath, comment.Position.OldLine, comment.Position.NewPath, comment.Position.NewLine)
 				}
 			}
 
 			commentBody := fmt.Sprintf(`> [!NOTE]
-> This comment was migrated from GitLab
+> This comment was migrated from GitLab.
 >
 > |      |      |
 > | ---- | ---- |
 > | **Original Author** | %[1]s |
-> | **Note ID** | %[2]d |
+> | **Note ID** | [%[2]d](https://%[5]s/%[6]s/%[7]s/merge_requests/%[8]d#note_%[2]d) |%[9]s
 > | **Date Originally Created** | %[3]s |
 > |      |      |
 >
 
-## Original Comment
-
-%[4]s`, commentAuthorStr, comment.ID, comment.CreatedAt.Format("Mon, 2 Jan 2006"), comment.Body)
+%[4]s`, commentAuthorStr, comment.ID, comment.CreatedAt.Format("Mon, 2 Jan 2006"), glCommentBodyStr, gitlabDomain, p.gitlabPath[0], p.gitlabPath[1], mergeRequest.IID, diffNoteRow)
 
 			foundExistingComment := false
 			for _, prComment := range prComments {
 				if prComment == nil {
 					continue
 				}
-
-				if strings.Contains(prComment.GetBody(), fmt.Sprintf("**Note ID** | %d", comment.ID)) {
+				// this has to match a portion of the comment body
+				if strings.Contains(prComment.GetBody(), fmt.Sprintf("**Note ID** | %d", comment.ID)) || strings.Contains(prComment.GetBody(), fmt.Sprintf("**Note ID** | [%d]", comment.ID)) {
 					foundExistingComment = true
 
 					if prComment.Body == nil || *prComment.Body != commentBody {
