@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -395,31 +394,28 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 		}
 
 		if issue.IsPullRequest() {
-			// Extract the PR number from the URL
-			prUrl, err := url.Parse(*issue.PullRequestLinks.URL)
-			if err != nil {
-				return false, fmt.Errorf("parsing pull request url: %v", err)
+			// Use the issue number directly (PRs are issues in GitHub)
+			prNumber := issue.GetNumber()
+			if prNumber == 0 {
+				continue
 			}
 
-			if m := regexp.MustCompile(".+/([0-9]+)$").FindStringSubmatch(prUrl.Path); len(m) == 2 {
-				prNumber, _ := strconv.Atoi(m[1])
-				pr, err := getGithubPullRequest(ctx, p.githubPath[0], p.githubPath[1], prNumber)
-				if err != nil {
-					return false, fmt.Errorf("retrieving pull request: %v", err)
-				}
+			pr, err := getGithubPullRequest(ctx, p.githubPath[0], p.githubPath[1], prNumber)
+			if err != nil {
+				return false, fmt.Errorf("retrieving pull request: %v", err)
+			}
 
-				if strings.Contains(pr.GetBody(), fmt.Sprintf("**GitLab MR Number** | %d", mergeRequest.IID)) ||
-					strings.Contains(pr.GetBody(), fmt.Sprintf("**GitLab MR Number** | [%d]", mergeRequest.IID)) {
-					logger.Info("found existing pull request", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pr.GetNumber())
-					pullRequest = pr
-					break
-				}
+			if strings.Contains(pr.GetBody(), fmt.Sprintf("**GitLab MR Number** | %d", mergeRequest.IID)) ||
+				strings.Contains(pr.GetBody(), fmt.Sprintf("**GitLab MR Number** | [%d]", mergeRequest.IID)) {
+				logger.Info("found existing pull request", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pr.GetNumber())
+				pullRequest = pr
+				break
 			}
 		}
 	}
 
 	if pullRequest != nil && pullRequest.State != nil && strings.EqualFold(*pullRequest.State, "closed") && !strings.EqualFold(mergeRequest.State, "opened") {
-		logger.Info("found existing pull request with original merged request both closed/merged. Skipping.", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber())
+		logger.Info("found existing pull request with original merged request both closed/merged. Skipping", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber())
 		return false, nil
 	}
 
@@ -774,12 +770,12 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 	* Migrate Comments
 	**********************************************************/
 
+	// get all gitlab merge request comments
 	var comments []*gitlab.Note
 	opts := &gitlab.ListMergeRequestNotesOptions{
 		OrderBy: pointer("created_at"),
 		Sort:    pointer("asc"),
 	}
-
 	logger.Debug("retrieving GitLab merge request comments", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
 	for {
 		result, resp, err := gl.Notes.ListMergeRequestNotes(p.project.ID, mergeRequest.IID, opts)
@@ -823,14 +819,19 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 
 			diffNoteRow := ""
 			if comment.Type == "DiffNote" && comment.Position != nil {
+				lineNumberStr := ""
+				if comment.Position.NewLine != 0 && comment.Position.OldLine != 0 {
+					lineNumberStr = fmt.Sprintf("%d->%d", comment.Position.OldLine, comment.Position.NewLine)
+				} else if comment.Position.NewLine != 0 {
+					lineNumberStr = fmt.Sprintf("%d", comment.Position.NewLine)
+				} else if comment.Position.OldLine != 0 {
+					lineNumberStr = fmt.Sprintf("%d", comment.Position.OldLine)
+				}
+
 				if comment.Position.OldPath == comment.Position.NewPath {
-					lineNumber := comment.Position.NewLine
-					if lineNumber == 0 && comment.Position.OldLine != 0 {
-						lineNumber = comment.Position.OldLine
-					}
-					diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s:%d` |", comment.Position.OldPath, lineNumber)
+					diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s (lineno %s)` |", comment.Position.OldPath, lineNumberStr)
 				} else {
-					diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s:%d` -> `%s:%d` |", comment.Position.OldPath, comment.Position.OldLine, comment.Position.NewPath, comment.Position.NewLine)
+					diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s -> %s (lineno %s)` |", comment.Position.OldPath, comment.Position.NewPath, lineNumberStr)
 				}
 			}
 
