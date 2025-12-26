@@ -363,43 +363,15 @@ func (p *project) fetchCommitFromRemote(ctx context.Context, commitID string) (*
 	return commit, nil
 }
 
-func (p *project) fetchBranchFromRemote(ctx context.Context, branchName string) error {
-	gitlabRemote, err := p.repo.Remote("gitlab")
-	if err != nil {
-		return fmt.Errorf("getting gitlab remote: %v", err)
-	}
-
-	refSpec := config.RefSpec(fmt.Sprintf("%s:refs/remotes/gitlab/%s", branchName, branchName))
-	if err := gitlabRemote.FetchContext(ctx, &git.FetchOptions{
-		RefSpecs: []config.RefSpec{refSpec},
-		Depth:    0,
-	}); err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
-		return fmt.Errorf("fetching branch %s directly from remote: %v", branchName, err)
-	}
-
-	logger.Debug("  successfully fetched branch from remote", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "branch", branchName)
-	return nil
-}
-
-func (p *project) createEmptyCommit(worktree *git.Worktree) (*object.Commit, error) {
-	// Use the default branch
+func (p *project) createEmptyCommit() (*object.Commit, error) {
+	// Resolve the default branch to get the parent commit
 	targetHash, err := p.repo.ResolveRevision(plumbing.Revision(p.defaultBranch))
 	if err != nil {
 		return nil, fmt.Errorf("resolving default branch %s: %v", p.defaultBranch, err)
 	}
 
-	if err := worktree.Checkout(&git.CheckoutOptions{
-		Hash: *targetHash,
-	}); err != nil {
-		return nil, fmt.Errorf("checking out branch for empty commit: %v", err)
-	}
-
-	// Get the current HEAD commit to use as parent
-	headRef, err := p.repo.Head()
-	if err != nil {
-		return nil, fmt.Errorf("getting HEAD reference: %v", err)
-	}
-	parentCommit, err := object.GetCommit(p.repo.Storer, headRef.Hash())
+	// Get the parent commit directly from the storer
+	parentCommit, err := object.GetCommit(p.repo.Storer, *targetHash)
 	if err != nil {
 		return nil, fmt.Errorf("getting parent commit: %v", err)
 	}
@@ -432,19 +404,13 @@ func (p *project) createEmptyCommit(worktree *git.Worktree) (*object.Commit, err
 		return nil, fmt.Errorf("saving empty commit: %v", err)
 	}
 
-	// Update HEAD to point to the new commit
-	newHeadRef := plumbing.NewHashReference(headRef.Name(), commitHash)
-	if err := p.repo.Storer.SetReference(newHeadRef); err != nil {
-		return nil, fmt.Errorf("updating HEAD to new commit: %v", err)
-	}
-
 	// Get the commit object to extract metadata
 	createdCommit, err := object.GetCommit(p.repo.Storer, commitHash)
 	if err != nil {
 		return nil, fmt.Errorf("retrieving created commit: %v", err)
 	}
 
-	logger.Debug("created empty commit", "commit_id", commitHash.String(), "sha", createdCommit.Hash)
+	logger.Debug("created empty commit", "sha", createdCommit.Hash)
 	return createdCommit, nil
 }
 
@@ -561,30 +527,8 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 	if strings.EqualFold(mergeRequest.State, "opened") {
 		if _, err = p.repo.Branch(mergeRequest.SourceBranch); err != nil {
 			if errors.Is(err, git.ErrBranchNotFound) {
-				// sometimes the branch is not available in the local repository, so we need to fetch it from the remote - maybe too old
-				// fetch branch from remote
-
-				if err = p.fetchBranchFromRemote(ctx, mergeRequest.SourceBranch); err != nil {
-					return false, fmt.Errorf("fetching source branch %s for merge request %d: %v", mergeRequest.SourceBranch, mergeRequest.IID, err)
-				}
-
-				// After fetching, the branch exists as a remote tracking branch (refs/remotes/gitlab/branchName)
-				// We need to create a local branch (refs/heads/branchName) from it
-				remoteBranchRef := plumbing.ReferenceName(fmt.Sprintf("refs/remotes/gitlab/%s", mergeRequest.SourceBranch))
-				remoteRef, err := p.repo.Reference(remoteBranchRef, false)
-				if err != nil {
-					return false, fmt.Errorf("remote tracking branch %s not found after fetch: %v", mergeRequest.SourceBranch, err)
-				}
-
-				// Create or update local branch pointing to the same commit as the remote tracking branch
-				localBranchRef := plumbing.NewBranchReferenceName(mergeRequest.SourceBranch)
-				localRef := plumbing.NewHashReference(localBranchRef, remoteRef.Hash())
-				if err = p.repo.Storer.SetReference(localRef); err != nil {
-					return false, fmt.Errorf("creating local branch %s from remote: %v", mergeRequest.SourceBranch, err)
-				}
-
-				// Verify the branch now exists - there is a problem that some branches can't be seen locally despite they should have been mirrored
-				// but creating the GitHub PR later works fine because the branch is already created on GitHub.
+				// there is a problem that some branches can't be seen locally despite they should have been mirrored
+				// but creating the GitHub PR later works fine because the branch is already created on GitHub
 				// so we will skip the verification for now
 				// if _, err = p.repo.Branch(mergeRequest.SourceBranch); err != nil {
 				// 	return false, fmt.Errorf("source branch %s does not exist for merge request %d after creation: %v", mergeRequest.SourceBranch, mergeRequest.IID, err)
@@ -598,12 +542,6 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 	// Proceed to create temporary branches when migrating a merged/closed merge request that doesn't yet have a counterpart PR in GitHub (can't create one without a branch)
 	if pullRequest == nil && !strings.EqualFold(mergeRequest.State, "opened") {
 		logger.Trace("searching for existing commits for closed/merged merge request", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
-
-		// Create a worktree
-		worktree, err := p.repo.Worktree()
-		if err != nil {
-			return false, fmt.Errorf("creating worktree: %v", err)
-		}
 
 		// Generate temporary branch names
 		mergeRequest.SourceBranch = sourceBranchForClosedMergeRequest
@@ -620,7 +558,7 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 		if len(mergeRequestCommits) == 0 {
 			logger.Debug("merge request has no commits, creating empty commit", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
 
-			commit, err := p.createEmptyCommit(worktree)
+			commit, err := p.createEmptyCommit()
 			if err != nil {
 				return false, err
 			}
@@ -677,7 +615,7 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 			// Orphaned commit, we cannot open a pull request as GitHub rejects it
 			logger.Debug("merge request has orphaned commits, creating empty commit instead", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
 
-			commit, err := p.createEmptyCommit(worktree)
+			commit, err := p.createEmptyCommit()
 			if err != nil {
 				return false, err
 			}
@@ -698,23 +636,17 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 		}
 
 		logger.Trace("creating target branch for merged/closed merge request", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "branch", mergeRequest.TargetBranch, "sha", startCommitParent.Hash)
-		if err = worktree.Checkout(&git.CheckoutOptions{
-			Create: true,
-			Force:  true,
-			Branch: plumbing.NewBranchReferenceName(mergeRequest.TargetBranch),
-			Hash:   startCommitParent.Hash,
-		}); err != nil {
-			return false, fmt.Errorf("checking out temporary target branch: %v", err)
+		targetBranchRef := plumbing.NewBranchReferenceName(mergeRequest.TargetBranch)
+		newTargetBranchRef := plumbing.NewHashReference(targetBranchRef, startCommitParent.Hash)
+		if err = p.repo.Storer.SetReference(newTargetBranchRef); err != nil {
+			return false, fmt.Errorf("creating target branch reference: %v", err)
 		}
 
 		logger.Trace("creating source branch for merged/closed merge request", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "branch", mergeRequest.SourceBranch, "sha", endCommit.Hash)
-		if err = worktree.Checkout(&git.CheckoutOptions{
-			Create: true,
-			Force:  true,
-			Branch: plumbing.NewBranchReferenceName(mergeRequest.SourceBranch),
-			Hash:   endCommit.Hash,
-		}); err != nil {
-			return false, fmt.Errorf("checking out temporary source branch: %v", err)
+		sourceBranchRef := plumbing.NewBranchReferenceName(mergeRequest.SourceBranch)
+		newSourceBranchRef := plumbing.NewHashReference(sourceBranchRef, endCommit.Hash)
+		if err = p.repo.Storer.SetReference(newSourceBranchRef); err != nil {
+			return false, fmt.Errorf("creating source branch reference: %v", err)
 		}
 
 		/*********************************************************
@@ -1071,11 +1003,11 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 >
 > |      |      |
 > | ---- | ---- |
-> | **Discussion ID** | %[1]s |
+> | **Discussion ID** | %s |
 > |      |      |
 >
 
-`, discussion.ID)
+`, fmt.Sprintf("`%s`", discussion.ID))
 			ghCommentBody += strings.Join(commentsPerDiscussion, "\n")
 
 			foundExistingComment := false
@@ -1084,7 +1016,7 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 					continue
 				}
 				// this has to match a portion of the comment body
-				if strings.Contains(prComment.GetBody(), fmt.Sprintf("**Discussion ID** | %s", discussion.ID)) {
+				if strings.Contains(prComment.GetBody(), fmt.Sprintf("**Discussion ID** | `%s`", discussion.ID)) {
 					foundExistingComment = true
 
 					if prComment.Body == nil || *prComment.Body != ghCommentBody {
