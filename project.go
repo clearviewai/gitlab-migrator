@@ -314,6 +314,11 @@ func (p *project) migrateMergeRequests(ctx context.Context, mergeRequestIDs *[]i
 		if ok, err := p.migrateMergeRequest(ctx, mergeRequest); err != nil {
 			sendErr(err)
 			failureCount++
+			if !skipInvalidMergeRequests {
+				// explicitly terminate to avoid MR <> PR number mismatch
+				// user should manually fix the mismatch and re-run
+				break
+			}
 		} else if ok {
 			successCount++
 		}
@@ -923,68 +928,70 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 	logger.Debug("retrieving GitHub pull request comments", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber())
 	prComments, _, err := gh.Issues.ListComments(ctx, p.githubPath[0], p.githubPath[1], pullRequest.GetNumber(), &github.IssueListCommentsOptions{Sort: pointer("created"), Direction: pointer("asc")})
 	if err != nil {
-		sendErr(fmt.Errorf("listing pull request comments: %v", err))
-	} else {
-		logger.Info("migrating merge request comments from GitLab to GitHub", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "count", len(comments))
+		return false, fmt.Errorf("listing pull request comments: %v", err)
+	}
 
-		for _, discussion := range discussions {
-			if discussion == nil {
+	logger.Info("migrating merge request comments from GitLab to GitHub", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "count", len(comments))
+
+	var discussionCommentIds []int
+	for _, discussion := range discussions {
+		if discussion == nil {
+			continue
+		}
+
+		// filter out system comments
+		discussionNotes := make([]*gitlab.Note, 0)
+		for _, comment := range discussion.Notes {
+			if comment == nil || comment.System {
 				continue
 			}
+			discussionNotes = append(discussionNotes, comment)
+		}
 
-			// filter out system comments
-			discussionNotes := make([]*gitlab.Note, 0)
-			for _, comment := range discussion.Notes {
-				if comment == nil || comment.System {
-					continue
-				}
-				discussionNotes = append(discussionNotes, comment)
-			}
+		if len(discussionNotes) == 0 {
+			continue
+		}
 
-			if len(discussionNotes) == 0 {
-				continue
-			}
+		// sort by created at ascending
+		sort.Slice(discussionNotes, func(i, j int) bool {
+			return discussionNotes[i].CreatedAt.Before(*discussionNotes[j].CreatedAt) // ascending
+		})
 
-			// sort by created at ascending
-			sort.Slice(discussionNotes, func(i, j int) bool {
-				return discussionNotes[i].CreatedAt.Before(*discussionNotes[j].CreatedAt) // ascending
-			})
-
-			commentsPerDiscussion := make([]string, 0)
-			for _, comment := range discussionNotes {
-				commentAuthorStr := ""
-				if comment.Author.Email != "" {
-					commentAuthorStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", comment.Author.Name, comment.Author.Username, comment.Author.Email)
+		commentsPerDiscussion := make([]string, 0)
+		for _, comment := range discussionNotes {
+			commentAuthorStr := ""
+			if comment.Author.Email != "" {
+				commentAuthorStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", comment.Author.Name, comment.Author.Username, comment.Author.Email)
+			} else {
+				commentAuthor, err := getGitlabUser(comment.Author.Username)
+				if err == nil {
+					commentAuthorStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", comment.Author.Name, comment.Author.Username, commentAuthor.Email)
 				} else {
-					commentAuthor, err := getGitlabUser(comment.Author.Username)
-					if err == nil {
-						commentAuthorStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", comment.Author.Name, comment.Author.Username, commentAuthor.Email)
-					} else {
-						commentAuthorStr = fmt.Sprintf("%s (@!%s)", comment.Author.Name, comment.Author.Username)
-					}
+					commentAuthorStr = fmt.Sprintf("%s (@!%s)", comment.Author.Name, comment.Author.Username)
+				}
+			}
+
+			glCommentBodyStr := strings.ReplaceAll(strings.ReplaceAll(comment.Body, "#", "#!"), "@", "@!")
+
+			diffNoteRow := ""
+			if comment.Position != nil {
+				lineNumberStr := ""
+				if comment.Position.NewLine != 0 && comment.Position.OldLine != 0 {
+					lineNumberStr = fmt.Sprintf("%d->%d", comment.Position.OldLine, comment.Position.NewLine)
+				} else if comment.Position.NewLine != 0 {
+					lineNumberStr = fmt.Sprintf("%d", comment.Position.NewLine)
+				} else if comment.Position.OldLine != 0 {
+					lineNumberStr = fmt.Sprintf("%d", comment.Position.OldLine)
 				}
 
-				glCommentBodyStr := strings.ReplaceAll(strings.ReplaceAll(comment.Body, "#", "#!"), "@", "@!")
-
-				diffNoteRow := ""
-				if comment.Type == "DiffNote" && comment.Position != nil {
-					lineNumberStr := ""
-					if comment.Position.NewLine != 0 && comment.Position.OldLine != 0 {
-						lineNumberStr = fmt.Sprintf("%d->%d", comment.Position.OldLine, comment.Position.NewLine)
-					} else if comment.Position.NewLine != 0 {
-						lineNumberStr = fmt.Sprintf("%d", comment.Position.NewLine)
-					} else if comment.Position.OldLine != 0 {
-						lineNumberStr = fmt.Sprintf("%d", comment.Position.OldLine)
-					}
-
-					if comment.Position.OldPath == comment.Position.NewPath {
-						diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s` (lineno `%s`) |", comment.Position.OldPath, lineNumberStr)
-					} else {
-						diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s` -> `%s` (lineno `%s`) |", comment.Position.OldPath, comment.Position.NewPath, lineNumberStr)
-					}
+				if comment.Position.OldPath == comment.Position.NewPath {
+					diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s` (lineno `%s`) |", comment.Position.OldPath, lineNumberStr)
+				} else {
+					diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s` -> `%s` (lineno `%s`) |", comment.Position.OldPath, comment.Position.NewPath, lineNumberStr)
 				}
+			}
 
-				commentBody := fmt.Sprintf(`>
+			commentBody := fmt.Sprintf(`>
 > |      |      |
 > | ---- | ---- |
 > | **Original Author** | %[1]s |
@@ -995,10 +1002,11 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 
 %[4]s`, commentAuthorStr, comment.ID, comment.CreatedAt.Format(dateFormat), glCommentBodyStr, gitlabDomain, p.gitlabPath[0], p.gitlabPath[1], mergeRequest.IID, diffNoteRow)
 
-				commentsPerDiscussion = append(commentsPerDiscussion, commentBody)
-			}
+			commentsPerDiscussion = append(commentsPerDiscussion, commentBody)
+			discussionCommentIds = append(discussionCommentIds, comment.ID)
+		}
 
-			ghCommentBody := fmt.Sprintf(`> [!NOTE]
+		ghCommentBody := fmt.Sprintf(`> [!NOTE]
 > This discussion was migrated from GitLab.
 >
 > |      |      |
@@ -1008,39 +1016,118 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 >
 
 `, fmt.Sprintf("`%s`", discussion.ID))
-			ghCommentBody += strings.Join(commentsPerDiscussion, "\n")
+		ghCommentBody += strings.Join(commentsPerDiscussion, "\n")
 
-			foundExistingComment := false
-			for _, prComment := range prComments {
-				if prComment == nil {
-					continue
-				}
-				// this has to match a portion of the comment body
-				if strings.Contains(prComment.GetBody(), fmt.Sprintf("**Discussion ID** | `%s`", discussion.ID)) {
-					foundExistingComment = true
+		foundExistingComment := false
+		for _, prComment := range prComments {
+			if prComment == nil {
+				continue
+			}
+			// this has to match a portion of the comment body
+			if strings.Contains(prComment.GetBody(), fmt.Sprintf("**Discussion ID** | `%s`", discussion.ID)) {
+				foundExistingComment = true
 
-					if prComment.Body == nil || *prComment.Body != ghCommentBody {
-						logger.Debug("updating pull request comment", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", prComment.GetID())
-						prComment.Body = &ghCommentBody
-						if _, _, err = gh.Issues.EditComment(ctx, p.githubPath[0], p.githubPath[1], prComment.GetID(), prComment); err != nil {
-							return false, fmt.Errorf("updating pull request comments: %v", err)
-						}
-					} else {
-						logger.Trace("existing pull request comment is up-to-date", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", prComment.GetID())
+				if prComment.Body == nil || *prComment.Body != ghCommentBody {
+					logger.Debug("updating pull request comment", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", prComment.GetID())
+					prComment.Body = &ghCommentBody
+					if _, _, err = gh.Issues.EditComment(ctx, p.githubPath[0], p.githubPath[1], prComment.GetID(), prComment); err != nil {
+						return false, fmt.Errorf("updating pull request comments: %v", err)
 					}
 				} else {
-					logger.Trace("existing pull request comment is not matched. Skipping", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", prComment.GetID())
+					logger.Trace("existing pull request comment is up-to-date", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", prComment.GetID())
 				}
+			} else {
+				logger.Trace("existing pull request comment is not matched. Skipping", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", prComment.GetID())
+			}
+		}
+
+		if !foundExistingComment {
+			logger.Debug("creating pull request comment", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber())
+			newComment := github.IssueComment{
+				Body: &ghCommentBody,
+			}
+			if _, _, err = gh.Issues.CreateComment(ctx, p.githubPath[0], p.githubPath[1], pullRequest.GetNumber(), &newComment); err != nil {
+				return false, fmt.Errorf("creating pull request comment: %v", err)
+			}
+		}
+	}
+
+	// stray comments that are not part of a discussion
+	for _, comment := range comments {
+		if comment == nil || comment.System || slices.Contains(discussionCommentIds, comment.ID) {
+			continue
+		}
+		commentAuthorStr := ""
+		if comment.Author.Email != "" {
+			commentAuthorStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", comment.Author.Name, comment.Author.Username, comment.Author.Email)
+		} else {
+			commentAuthor, err := getGitlabUser(comment.Author.Username)
+			if err == nil {
+				commentAuthorStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", comment.Author.Name, comment.Author.Username, commentAuthor.Email)
+			} else {
+				commentAuthorStr = fmt.Sprintf("%s (@!%s)", comment.Author.Name, comment.Author.Username)
+			}
+		}
+
+		glCommentBodyStr := strings.ReplaceAll(strings.ReplaceAll(comment.Body, "#", "#!"), "@", "@!")
+
+		diffNoteRow := ""
+		if comment.Position != nil {
+			lineNumberStr := ""
+			if comment.Position.NewLine != 0 && comment.Position.OldLine != 0 {
+				lineNumberStr = fmt.Sprintf("%d->%d", comment.Position.OldLine, comment.Position.NewLine)
+			} else if comment.Position.NewLine != 0 {
+				lineNumberStr = fmt.Sprintf("%d", comment.Position.NewLine)
+			} else if comment.Position.OldLine != 0 {
+				lineNumberStr = fmt.Sprintf("%d", comment.Position.OldLine)
 			}
 
-			if !foundExistingComment {
-				logger.Debug("creating pull request comment", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber())
-				newComment := github.IssueComment{
-					Body: &ghCommentBody,
+			if comment.Position.OldPath == comment.Position.NewPath {
+				diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s` (lineno `%s`) |", comment.Position.OldPath, lineNumberStr)
+			} else {
+				diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s` -> `%s` (lineno `%s`) |", comment.Position.OldPath, comment.Position.NewPath, lineNumberStr)
+			}
+		}
+
+		commentBody := fmt.Sprintf(`>
+> |      |      |
+> | ---- | ---- |
+> | **Original Author** | %[1]s |
+> | **Note ID** | [%[2]d](https://%[5]s/%[6]s/%[7]s/merge_requests/%[8]d#note_%[2]d) |%[9]s
+> | **Time Originally Created** | %[3]s |
+> |      |      |
+>
+
+%[4]s`, commentAuthorStr, comment.ID, comment.CreatedAt.Format(dateFormat), glCommentBodyStr, gitlabDomain, p.gitlabPath[0], p.gitlabPath[1], mergeRequest.IID, diffNoteRow)
+
+		foundExistingComment := false
+		for _, prComment := range prComments {
+			if prComment == nil {
+				continue
+			}
+
+			if strings.Contains(prComment.GetBody(), fmt.Sprintf("**Note ID** | %d", comment.ID)) || strings.Contains(prComment.GetBody(), fmt.Sprintf("**Note ID** | [%d]", comment.ID)) {
+				foundExistingComment = true
+
+				if prComment.Body == nil || *prComment.Body != commentBody {
+					logger.Debug("updating pull request comment", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", prComment.GetID())
+					prComment.Body = &commentBody
+					if _, _, err = gh.Issues.EditComment(ctx, p.githubPath[0], p.githubPath[1], prComment.GetID(), prComment); err != nil {
+						return false, fmt.Errorf("updating pull request comments: %v", err)
+					}
 				}
-				if _, _, err = gh.Issues.CreateComment(ctx, p.githubPath[0], p.githubPath[1], pullRequest.GetNumber(), &newComment); err != nil {
-					return false, fmt.Errorf("creating pull request comment: %v", err)
-				}
+			} else {
+				logger.Trace("existing pull request comment is up-to-date", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", prComment.GetID())
+			}
+		}
+
+		if !foundExistingComment {
+			logger.Debug("creating pull request comment", "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber())
+			newComment := github.IssueComment{
+				Body: &commentBody,
+			}
+			if _, _, err = gh.Issues.CreateComment(ctx, p.githubPath[0], p.githubPath[1], pullRequest.GetNumber(), &newComment); err != nil {
+				return false, fmt.Errorf("creating pull request comment: %v", err)
 			}
 		}
 	}
