@@ -293,12 +293,12 @@ func (p *project) migrateMergeRequests(ctx context.Context, mergeRequestIDs *[]i
 
 		mergeRequests = append(mergeRequests, result...)
 
+		nPages++
 		if resp.NextPage == 0 {
 			break
 		}
 
 		opts.Page = resp.NextPage
-		nPages++
 	}
 	logger.Debug("retrieved merge requests", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "count", len(mergeRequests), "n_pages", nPages)
 
@@ -579,6 +579,7 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 	}
 
 	// Proceed to create temporary branches when migrating a merged/closed merge request that doesn't yet have a counterpart PR in GitHub (can't create one without a branch)
+	// if !strings.EqualFold(mergeRequest.State, "opened") { // for debugging
 	if pullRequest == nil && !strings.EqualFold(mergeRequest.State, "opened") {
 		logger.Trace("searching for existing commits for closed/merged merge request", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
 
@@ -602,14 +603,14 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 
 			mergeRequestCommits = append(mergeRequestCommits, result...)
 
+			nPages++
 			if resp.NextPage == 0 {
 				break
 			}
 
 			commitsOpts.Page = resp.NextPage
-			nPages++
 		}
-		logger.Debug("retrieved merge request commits", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "count", len(mergeRequestCommits), "n_pages", nPages)
+		logger.Info("retrieved merge request commits", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "count", len(mergeRequestCommits), "n_pages", nPages)
 
 		var startCommit, endCommit *object.Commit
 		// Some merge requests have no commits, create an empty commit instead
@@ -702,6 +703,9 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 		if err = p.repo.Storer.SetReference(newSourceBranchRef); err != nil {
 			return false, fmt.Errorf("creating source branch reference: %v", err)
 		}
+
+		// // early return for debugging
+		// return true, nil
 
 		/*********************************************************
 		* Push Temporary Branches
@@ -950,7 +954,6 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 		OrderBy: pointer("created_at"),
 		Sort:    pointer("asc"),
 	}
-	logger.Debug("retrieving GitLab merge request comments", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
 	nPages := 0
 	for {
 		result, resp, err := gl.Notes.ListMergeRequestNotes(p.project.ID, mergeRequest.IID, opts)
@@ -960,12 +963,12 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 
 		comments = append(comments, result...)
 
+		nPages++
 		if resp.NextPage == 0 {
 			break
 		}
 
 		opts.Page = resp.NextPage
-		nPages++
 	}
 	logger.Debug("retrieved GitLab merge request comments", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "count", len(comments), "n_pages", nPages)
 
@@ -982,20 +985,20 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 		}
 		discussions = append(discussions, result...)
 
+		nPages++
 		if resp.NextPage == 0 {
 			break
 		}
 
 		discussionsOpts.Page = resp.NextPage
-		nPages++
 	}
 	logger.Debug("retrieved GitLab merge request discussions", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "count", len(discussions), "n_pages", nPages)
 
-	logger.Debug("retrieving GitHub pull request comments", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber())
 	prComments, _, err := gh.Issues.ListComments(ctx, p.githubPath[0], p.githubPath[1], pullRequest.GetNumber(), &github.IssueListCommentsOptions{Sort: pointer("created"), Direction: pointer("asc")})
 	if err != nil {
 		return false, fmt.Errorf("listing pull request comments: %v", err)
 	}
+	logger.Debug("retrieved GitHub pull request comments", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "count", len(prComments))
 
 	logger.Info("migrating merge request comments from GitLab to GitHub", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "count", len(comments))
 
