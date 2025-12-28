@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	dateFormat          = time.RFC1123
+	dateFormat          = time.RFC3339
 	defaultGithubDomain = "github.com"
 	defaultGitlabDomain = "gitlab.com"
 )
