@@ -314,7 +314,7 @@ func (p *project) migrateMergeRequests(ctx context.Context, mergeRequestIDs *[]i
 			ids[i] = i + 1
 		}
 		mergeRequestIDs = &ids
-		logger.Info("we will fill in the gaps with empty pull requests from 1 to maxMergeRequestNumber")
+		logger.Info(fmt.Sprintf("we will fill in the gaps with empty pull requests from 1 to %d", maxMergeRequestNumber))
 	} else {
 		logger.Info("we will fill in missing merge requests with empty pull requests")
 	}
@@ -658,6 +658,7 @@ func (p *project) createEmptyPullRequest(ctx context.Context, mergeRequestIID in
 	if err != nil {
 		return false, fmt.Errorf("listing pull requests: %v", err)
 	}
+	logger.Debug("search results for pull requests", "owner", p.githubPath[0], "repo", p.githubPath[1], "merge_request_id", mergeRequestIID, "count", len(searchResult.Issues))
 
 	// Look for an existing GitHub pull request
 	for _, issue := range searchResult.Issues {
@@ -1240,11 +1241,24 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 	}
 	logger.Debug("retrieved GitLab merge request comments", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "count", len(comments), "n_pages", nPages)
 
-	prComments, _, err := gh.Issues.ListComments(ctx, p.githubPath[0], p.githubPath[1], pullRequest.GetNumber(), &github.IssueListCommentsOptions{Sort: pointer("created"), Direction: pointer("asc")})
-	if err != nil {
-		return false, fmt.Errorf("listing pull request comments: %v", err)
+	var prComments []*github.IssueComment
+	ghCommentsOpts := &github.IssueListCommentsOptions{Sort: pointer("created"), Direction: pointer("asc"), ListOptions: github.ListOptions{PerPage: 100}}
+	nPages = 0
+	for {
+		result, resp, err := gh.Issues.ListComments(ctx, p.githubPath[0], p.githubPath[1], pullRequest.GetNumber(), ghCommentsOpts)
+		if err != nil {
+			return false, fmt.Errorf("listing pull request comments: %v", err)
+		}
+		prComments = append(prComments, result...)
+
+		nPages++
+		if resp.NextPage == 0 {
+			break
+		}
+
+		ghCommentsOpts.Page = resp.NextPage
 	}
-	logger.Debug("retrieved GitHub pull request comments", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "count", len(prComments))
+	logger.Debug("retrieved GitHub pull request comments", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "count", len(prComments), "n_pages", nPages)
 
 	/*********************************************************
 	* Migrate Discussions
@@ -1389,7 +1403,7 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 				if prComment.Body == nil || *prComment.Body != ghCommentBody {
 					logger.Debug("updating pull request comment", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "gh_comment_id", prComment.GetID())
 					prComment.Body = &ghCommentBody
-					if _, _, err = gh.Issues.EditComment(ctx, p.githubPath[0], p.githubPath[1], prComment.GetID(), prComment); err != nil {
+					if _, _, err := gh.Issues.EditComment(ctx, p.githubPath[0], p.githubPath[1], prComment.GetID(), prComment); err != nil {
 						return false, fmt.Errorf("updating pull request comments: %v", err)
 					}
 				} else {
@@ -1403,7 +1417,7 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 			newComment := github.IssueComment{
 				Body: &ghCommentBody,
 			}
-			if _, _, err = gh.Issues.CreateComment(ctx, p.githubPath[0], p.githubPath[1], pullRequest.GetNumber(), &newComment); err != nil {
+			if _, _, err := gh.Issues.CreateComment(ctx, p.githubPath[0], p.githubPath[1], pullRequest.GetNumber(), &newComment); err != nil {
 				return false, fmt.Errorf("creating pull request comment: %v", err)
 			}
 		}
@@ -1493,7 +1507,7 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 				if prComment.Body == nil || *prComment.Body != commentBody {
 					logger.Debug("updating pull request comment", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "gh_comment_id", prComment.GetID())
 					prComment.Body = &commentBody
-					if _, _, err = gh.Issues.EditComment(ctx, p.githubPath[0], p.githubPath[1], prComment.GetID(), prComment); err != nil {
+					if _, _, err := gh.Issues.EditComment(ctx, p.githubPath[0], p.githubPath[1], prComment.GetID(), prComment); err != nil {
 						return false, fmt.Errorf("updating pull request comments: %v", err)
 					}
 				} else {
@@ -1507,7 +1521,7 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 			newComment := github.IssueComment{
 				Body: &commentBody,
 			}
-			if _, _, err = gh.Issues.CreateComment(ctx, p.githubPath[0], p.githubPath[1], pullRequest.GetNumber(), &newComment); err != nil {
+			if _, _, err := gh.Issues.CreateComment(ctx, p.githubPath[0], p.githubPath[1], pullRequest.GetNumber(), &newComment); err != nil {
 				return false, fmt.Errorf("creating pull request comment: %v", err)
 			}
 		}

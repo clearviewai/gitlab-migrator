@@ -63,7 +63,12 @@ func getGithubSearchResults(ctx context.Context, query string) (*github.IssuesSe
 	result := cache.getGithubSearchResults(query)
 	if result == nil {
 		logger.Debug("performing search", "query", query)
-		result, _, err = gh.Search.Issues(ctx, query, nil)
+		opts := &github.SearchOptions{
+			ListOptions: github.ListOptions{
+				PerPage: 100, // this should be enough given the query filtering
+			},
+		}
+		result, _, err = gh.Search.Issues(ctx, query, opts)
 		if err != nil {
 			return nil, fmt.Errorf("performing issue search: %v", err)
 		}
