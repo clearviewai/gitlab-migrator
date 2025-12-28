@@ -308,63 +308,42 @@ func (p *project) migrateMergeRequests(ctx context.Context, mergeRequestIDs *[]i
 	}
 	logger.Debug("retrieved merge requests", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "count", len(mergeRequests), "n_pages", nPages)
 
-	var successCount, failureCount int
-	var totalCount int
-
 	if mergeRequestIDs == nil {
-		totalCount = maxMergeRequestNumber
-		logger.Info("migrating merge requests from GitLab to GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "count", totalCount)
+		ids := make([]int, maxMergeRequestNumber)
+		for i := range ids {
+			ids[i] = i + 1
+		}
+		mergeRequestIDs = &ids
 		logger.Info("we will fill in the gaps with empty pull requests from 1 to maxMergeRequestNumber")
-		for i := 1; i <= maxMergeRequestNumber; i++ {
-			mergeRequest := mergeRequests[i]
-			var ok bool
-			var err error
-			if mergeRequest == nil {
-				// this happened to one MR that does not exist on GitLab
-				ok, err = p.createEmptyPullRequest(ctx, i)
-			} else {
-				ok, err = p.migrateMergeRequest(ctx, mergeRequest)
-			}
-			if err != nil {
-				sendErr(err)
-				failureCount++
-				if !skipInvalidMergeRequests {
-					// explicitly terminate to avoid MR <> PR number mismatch
-					// user should manually fix the mismatch and re-run
-					break
-				}
-			} else if ok {
-				successCount++
-			}
-			logger.Info("--------------------------------")
-		}
 	} else {
-		totalCount = len(*mergeRequestIDs)
-		logger.Info("migrating merge requests from GitLab to GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "count", totalCount)
 		logger.Info("we will fill in missing merge requests with empty pull requests")
-		for _, mergeRequestID := range *mergeRequestIDs {
-			mergeRequest := mergeRequests[mergeRequestID]
-			var ok bool
-			var err error
-			if mergeRequest == nil {
-				// this happened to one MR that does not exist on GitLab
-				ok, err = p.createEmptyPullRequest(ctx, mergeRequestID)
-			} else {
-				ok, err = p.migrateMergeRequest(ctx, mergeRequest)
-			}
-			if err != nil {
-				sendErr(err)
-				failureCount++
-				if !skipInvalidMergeRequests {
-					// explicitly terminate to avoid MR <> PR number mismatch
-					// user should manually fix the mismatch and re-run
-					break
-				}
-			} else if ok {
-				successCount++
-			}
-			logger.Info("--------------------------------")
+	}
+
+	var successCount, failureCount int
+	totalCount := len(*mergeRequestIDs)
+	logger.Info("migrating merge requests from GitLab to GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "count", totalCount)
+	for _, mergeRequestID := range *mergeRequestIDs {
+		mergeRequest := mergeRequests[mergeRequestID]
+		var ok bool
+		var err error
+		if mergeRequest == nil {
+			// this happened to one MR that does not exist on GitLab
+			ok, err = p.createEmptyPullRequest(ctx, mergeRequestID)
+		} else {
+			ok, err = p.migrateMergeRequest(ctx, mergeRequest)
 		}
+		if err != nil {
+			sendErr(err)
+			failureCount++
+			if !skipInvalidMergeRequests {
+				// explicitly terminate to avoid MR <> PR number mismatch
+				// user should manually fix the mismatch and re-run
+				break
+			}
+		} else if ok {
+			successCount++
+		}
+		logger.Info("--------------------------------")
 	}
 
 	skippedCount := totalCount - successCount - failureCount
@@ -375,14 +354,14 @@ func (p *project) migrateMergeRequests(ctx context.Context, mergeRequestIDs *[]i
 func (p *project) getMergeRequestCommits(ctx context.Context, mergeRequest *gitlab.MergeRequest) ([]*gitlab.Commit, *object.Commit, *object.Commit, error) {
 	logger.Trace("retrieving commits for merge request", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
 	var mergeRequestCommits []*gitlab.Commit
-	commitsOpts := &gitlab.GetMergeRequestCommitsOptions{
+	opts := &gitlab.GetMergeRequestCommitsOptions{
 		OrderBy: "created_at",
 		Sort:    "asc",
 		PerPage: 100,
 	}
 	nPages := 0
 	for {
-		result, resp, err := gl.MergeRequests.GetMergeRequestCommits(p.project.ID, mergeRequest.IID, commitsOpts)
+		result, resp, err := gl.MergeRequests.GetMergeRequestCommits(p.project.ID, mergeRequest.IID, opts)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("retrieving merge request commits: %v", err)
 		}
@@ -394,7 +373,7 @@ func (p *project) getMergeRequestCommits(ctx context.Context, mergeRequest *gitl
 			break
 		}
 
-		commitsOpts.Page = resp.NextPage
+		opts.Page = resp.NextPage
 	}
 	logger.Info("retrieved merge request commits", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "count", len(mergeRequestCommits), "n_pages", nPages)
 
@@ -479,7 +458,7 @@ func (p *project) fetchCommitFromRemote(ctx context.Context, commitID string) (*
 	// First check if commit already exists
 	commit, err := object.GetCommit(p.repo.Storer, commitHash)
 	if err == nil {
-		logger.Debug("  commit already exists in local repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "sha", commitID)
+		logger.Trace("  commit already exists in local repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "sha", commitID)
 		return commit, nil
 	}
 
@@ -488,7 +467,7 @@ func (p *project) fetchCommitFromRemote(ctx context.Context, commitID string) (*
 		return nil, fmt.Errorf("getting gitlab remote: %v", err)
 	}
 
-	logger.Debug("  fetching commit directly by SHA from remote", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "sha", commitID)
+	logger.Trace("  fetching commit directly by SHA from remote", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "sha", commitID)
 
 	// Fetch the commit directly by SHA (GitLab supports this)
 	refSpec := config.RefSpec(fmt.Sprintf("%s:refs/remotes/gitlab/%s", commitID, commitID))
@@ -505,7 +484,7 @@ func (p *project) fetchCommitFromRemote(ctx context.Context, commitID string) (*
 		return nil, fmt.Errorf("commit %s still not found after fetch: %v", commitID, err)
 	}
 
-	logger.Debug("  successfully fetched commit from remote", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "sha", commitID)
+	logger.Trace("  successfully fetched commit from remote", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "sha", commitID)
 	return commit, nil
 }
 
@@ -728,12 +707,11 @@ func (p *project) createEmptyPullRequest(ctx context.Context, mergeRequestIID in
 	// Proceed to create temporary branches when migrating the empty MR doesn't yet have a counterpart PR in GitHub (can't create one without a branch)
 	if pullRequest == nil {
 		// look for the parent commit on the target branch to branch out from
-		var startCommitParent *object.Commit
 		if startCommit.NumParents() > 1 {
 			logger.Warn("start commit has multiple parents", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequestIID, "sha", startCommit.Hash, "num_parents", startCommit.NumParents())
 		}
 		logger.Trace("inspecting start commit parent", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequestIID, "sha", startCommit.Hash)
-		startCommitParent, err = startCommit.Parent(0)
+		startCommitParent, err := startCommit.Parent(0)
 		if err != nil || startCommitParent == nil {
 			return false, fmt.Errorf("identifying suitable parent of start commit %s for merge request %d", startCommit.Hash, mergeRequestIID)
 		}
@@ -900,7 +878,7 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 		return false, fmt.Errorf("getting merge request commits: %v", err)
 	}
 
-	mergeRequestCommitsSectionStr := fmt.Sprintf("## Original Commits (%d total):\n", len(mergeRequestCommits))
+	mergeRequestCommitsSectionStr := fmt.Sprintf("## Original Commits (%d in total):\n", len(mergeRequestCommits))
 	for _, commit := range mergeRequestCommits {
 		mergeRequestCommitsSectionStr += fmt.Sprintf(
 			"[`%[1]s`](https://%[5]s/%[6]s/%[7]s/commit/%[8]s) `%[2]s`: %[4]s - [%[3]s](mailto:%[9]s)\n",
@@ -943,12 +921,11 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 		mergeRequest.TargetBranch = targetBranchForClosedMergeRequest
 
 		// look for the parent commit on the target branch to branch out from
-		var startCommitParent *object.Commit
 		if startCommit.NumParents() > 1 {
 			logger.Warn("start commit has multiple parents", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "sha", startCommit.Hash, "num_parents", startCommit.NumParents())
 		}
 		logger.Trace("inspecting start commit parent", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "sha", startCommit.Hash)
-		startCommitParent, err = startCommit.Parent(0)
+		startCommitParent, err := startCommit.Parent(0)
 		if err != nil || startCommitParent == nil {
 			return false, fmt.Errorf("identifying suitable parent of start commit %s for merge request %d", startCommit.Hash, mergeRequest.IID)
 		}
@@ -1212,33 +1189,6 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 }
 
 func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest *gitlab.MergeRequest, pullRequest *github.PullRequest) (bool, error) {
-	// get all gitlab merge request comments
-	var comments []*gitlab.Note
-	opts := &gitlab.ListMergeRequestNotesOptions{
-		ListOptions: gitlab.ListOptions{
-			PerPage: 100,
-		},
-		OrderBy: pointer("created_at"),
-		Sort:    pointer("asc"),
-	}
-	nPages := 0
-	for {
-		result, resp, err := gl.Notes.ListMergeRequestNotes(p.project.ID, mergeRequest.IID, opts)
-		if err != nil {
-			return false, fmt.Errorf("listing merge request notes: %v", err)
-		}
-
-		comments = append(comments, result...)
-
-		nPages++
-		if resp.NextPage == 0 {
-			break
-		}
-
-		opts.Page = resp.NextPage
-	}
-	logger.Debug("retrieved GitLab merge request comments", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "count", len(comments), "n_pages", nPages)
-
 	// get all gitlab discussions
 	var discussions []*gitlab.Discussion
 	discussionsOpts := &gitlab.ListMergeRequestDiscussionsOptions{
@@ -1246,7 +1196,7 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 		Sort:    "asc",
 		PerPage: 100,
 	}
-	nPages = 0
+	nPages := 0
 	for {
 		result, resp, err := gl.Discussions.ListMergeRequestDiscussions(p.project.ID, mergeRequest.IID, discussionsOpts)
 		if err != nil {
@@ -1263,13 +1213,42 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 	}
 	logger.Debug("retrieved GitLab merge request discussions", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "count", len(discussions), "n_pages", nPages)
 
+	// get all gitlab merge request comments
+	var comments []*gitlab.Note
+	commentsOpts := &gitlab.ListMergeRequestNotesOptions{
+		ListOptions: gitlab.ListOptions{
+			PerPage: 100,
+		},
+		OrderBy: pointer("created_at"),
+		Sort:    pointer("asc"),
+	}
+	nPages = 0
+	for {
+		result, resp, err := gl.Notes.ListMergeRequestNotes(p.project.ID, mergeRequest.IID, commentsOpts)
+		if err != nil {
+			return false, fmt.Errorf("listing merge request notes: %v", err)
+		}
+
+		comments = append(comments, result...)
+
+		nPages++
+		if resp.NextPage == 0 {
+			break
+		}
+
+		commentsOpts.Page = resp.NextPage
+	}
+	logger.Debug("retrieved GitLab merge request comments", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "count", len(comments), "n_pages", nPages)
+
 	prComments, _, err := gh.Issues.ListComments(ctx, p.githubPath[0], p.githubPath[1], pullRequest.GetNumber(), &github.IssueListCommentsOptions{Sort: pointer("created"), Direction: pointer("asc")})
 	if err != nil {
 		return false, fmt.Errorf("listing pull request comments: %v", err)
 	}
 	logger.Debug("retrieved GitHub pull request comments", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "count", len(prComments))
 
-	logger.Info("migrating merge request comments from GitLab to GitHub", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "raw_comments", len(comments), "discussions", len(discussions))
+	/*********************************************************
+	* Migrate Discussions
+	**********************************************************/
 
 	// trim discussion notes
 	var trimmedDiscussions []*gitlab.Discussion
@@ -1286,7 +1265,7 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 			}
 
 			if strings.HasPrefix(comment.Author.Username, "GitLab-") || strings.HasPrefix(comment.Author.Username, "gitlab-") {
-				logger.Trace("skipping system comment", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", comment.ID)
+				logger.Trace("skipping system comment", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "gl_comment_id", comment.ID)
 				continue
 			}
 
@@ -1313,8 +1292,39 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 		return trimmedDiscussions[i].Notes[0].CreatedAt.Before(*trimmedDiscussions[j].Notes[0].CreatedAt) // ascending
 	})
 
+	logger.Info("migrating merge request discussions from GitLab to GitHub", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "discussions", len(discussions), "trimmed_discussions", len(trimmedDiscussions))
+
 	var discussionCommentIds []int
 	for _, discussion := range trimmedDiscussions {
+		positionIsTheSame := true
+		// we know the Notes has at least one note, so we can safely access the first note's position
+		discussionPosition := discussion.Notes[0].Position
+		for _, comment := range discussion.Notes {
+			if comment.Position != nil && (comment.Position.OldPath != discussionPosition.OldPath || comment.Position.NewPath != discussionPosition.NewPath || comment.Position.OldLine != discussionPosition.OldLine || comment.Position.NewLine != discussionPosition.NewLine) {
+				positionIsTheSame = false
+				break
+			}
+		}
+		logger.Trace("discussion position", "merge_request_id", mergeRequest.IID, "discussion_id", discussion.ID, "position_is_the_same", positionIsTheSame)
+
+		discussionDiffNoteRow := ""
+		if positionIsTheSame && discussionPosition != nil {
+			lineNumberStr := ""
+			if discussionPosition.NewLine != 0 && discussionPosition.OldLine != 0 {
+				lineNumberStr = fmt.Sprintf("%d->%d", discussionPosition.OldLine, discussionPosition.NewLine)
+			} else if discussionPosition.NewLine != 0 {
+				lineNumberStr = fmt.Sprintf("%d", discussionPosition.NewLine)
+			} else if discussionPosition.OldLine != 0 {
+				lineNumberStr = fmt.Sprintf("%d", discussionPosition.OldLine)
+			}
+
+			if discussionPosition.OldPath == discussionPosition.NewPath {
+				discussionDiffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s` (lineno `%s`) |", discussionPosition.OldPath, lineNumberStr)
+			} else {
+				discussionDiffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s` -> `%s` (lineno `%s`) |", discussionPosition.OldPath, discussionPosition.NewPath, lineNumberStr)
+			}
+		}
+
 		var commentsPerDiscussion []string
 		for _, comment := range discussion.Notes {
 			commentAuthorStr := ""
@@ -1332,7 +1342,7 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 			glCommentBodyStr := strings.ReplaceAll(strings.ReplaceAll(comment.Body, "#", "#!"), "@", "@!")
 
 			diffNoteRow := ""
-			if comment.Position != nil {
+			if !positionIsTheSame && comment.Position != nil {
 				lineNumberStr := ""
 				if comment.Position.NewLine != 0 && comment.Position.OldLine != 0 {
 					lineNumberStr = fmt.Sprintf("%d->%d", comment.Position.OldLine, comment.Position.NewLine)
@@ -1343,22 +1353,13 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 				}
 
 				if comment.Position.OldPath == comment.Position.NewPath {
-					diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s` (lineno `%s`) |", comment.Position.OldPath, lineNumberStr)
+					diffNoteRow = fmt.Sprintf("\n`%s` (lineno `%s`)", comment.Position.OldPath, lineNumberStr)
 				} else {
-					diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s` -> `%s` (lineno `%s`) |", comment.Position.OldPath, comment.Position.NewPath, lineNumberStr)
+					diffNoteRow = fmt.Sprintf("\n`%s` -> `%s` (lineno `%s`)", comment.Position.OldPath, comment.Position.NewPath, lineNumberStr)
 				}
 			}
 
-			commentBody := fmt.Sprintf(`>
-> |      |      |
-> | ---- | ---- |
-> | **Original Author** | %[1]s |
-> | **Note ID** | [%[2]d](https://%[5]s/%[6]s/%[7]s/merge_requests/%[8]d#note_%[2]d) |%[9]s
-> | **Time Originally Created** | %[3]s |
-> |      |      |
->
-
-%[4]s`, commentAuthorStr, comment.ID, comment.CreatedAt.Format(dateFormat), glCommentBodyStr, gitlabDomain, p.gitlabPath[0], p.gitlabPath[1], mergeRequest.IID, diffNoteRow)
+			commentBody := fmt.Sprintf("`%[3]s` %[1]s (Note [%[2]d](https://%[5]s/%[6]s/%[7]s/merge_requests/%[8]d#note_%[2]d))%[9]s\n\n%[4]s", commentAuthorStr, comment.ID, comment.CreatedAt.Format(dateFormat), glCommentBodyStr, gitlabDomain, p.gitlabPath[0], p.gitlabPath[1], mergeRequest.IID, diffNoteRow)
 
 			commentsPerDiscussion = append(commentsPerDiscussion, commentBody)
 			discussionCommentIds = append(discussionCommentIds, comment.ID)
@@ -1369,12 +1370,12 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 >
 > |      |      |
 > | ---- | ---- |
-> | **Discussion ID** | %s |
+> | **Discussion ID** | %[1]s |%[2]s
 > |      |      |
 >
 
-`, fmt.Sprintf("`%s`", discussion.ID))
-		ghCommentBody += strings.Join(commentsPerDiscussion, "\n")
+`, fmt.Sprintf("`%s`", discussion.ID), discussionDiffNoteRow)
+		ghCommentBody += strings.Join(commentsPerDiscussion, "\n\n---\n\n")
 
 		foundExistingComment := false
 		for _, prComment := range prComments {
@@ -1386,16 +1387,14 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 				foundExistingComment = true
 
 				if prComment.Body == nil || *prComment.Body != ghCommentBody {
-					logger.Debug("updating pull request comment", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", prComment.GetID())
+					logger.Debug("updating pull request comment", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "gh_comment_id", prComment.GetID())
 					prComment.Body = &ghCommentBody
 					if _, _, err = gh.Issues.EditComment(ctx, p.githubPath[0], p.githubPath[1], prComment.GetID(), prComment); err != nil {
 						return false, fmt.Errorf("updating pull request comments: %v", err)
 					}
 				} else {
-					logger.Trace("existing pull request comment is up-to-date", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", prComment.GetID())
+					logger.Trace("existing pull request comment is up-to-date", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "gh_comment_id", prComment.GetID())
 				}
-			} else {
-				logger.Trace("existing pull request comment is not matched. Skipping", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", prComment.GetID())
 			}
 		}
 
@@ -1410,17 +1409,33 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 		}
 	}
 
+	/*********************************************************
+	* Migrate Stray Comments
+	**********************************************************/
+
 	// stray comments that are not part of a discussion
+	var strayComments []*gitlab.Note
 	for _, comment := range comments {
 		if comment == nil || comment.System || slices.Contains(discussionCommentIds, comment.ID) {
 			continue
 		}
 
 		if strings.HasPrefix(comment.Author.Username, "GitLab-") || strings.HasPrefix(comment.Author.Username, "gitlab-") {
-			logger.Trace("skipping system comment", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", comment.ID)
+			logger.Trace("skipping system comment", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "gl_comment_id", comment.ID)
 			continue
 		}
 
+		strayComments = append(strayComments, comment)
+	}
+
+	// sort by created at ascending
+	sort.Slice(strayComments, func(i, j int) bool {
+		return strayComments[i].CreatedAt.Before(*strayComments[j].CreatedAt) // ascending
+	})
+
+	logger.Info("migrating merge request stray comments from GitLab to GitHub", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comments", len(comments), "stray_comments", len(strayComments))
+
+	for _, comment := range strayComments {
 		commentAuthorStr := ""
 		if comment.Author.Email != "" {
 			commentAuthorStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", comment.Author.Name, comment.Author.Username, comment.Author.Email)
@@ -1453,7 +1468,9 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 			}
 		}
 
-		commentBody := fmt.Sprintf(`>
+		commentBody := fmt.Sprintf(`> [!NOTE]
+> This comment was migrated from GitLab.
+>
 > |      |      |
 > | ---- | ---- |
 > | **Original Author** | %[1]s |
@@ -1474,16 +1491,14 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 				foundExistingComment = true
 
 				if prComment.Body == nil || *prComment.Body != commentBody {
-					logger.Debug("updating pull request comment", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", prComment.GetID())
+					logger.Debug("updating pull request comment", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "gh_comment_id", prComment.GetID())
 					prComment.Body = &commentBody
 					if _, _, err = gh.Issues.EditComment(ctx, p.githubPath[0], p.githubPath[1], prComment.GetID(), prComment); err != nil {
 						return false, fmt.Errorf("updating pull request comments: %v", err)
 					}
 				} else {
-					logger.Trace("existing pull request comment is up-to-date", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", prComment.GetID())
+					logger.Trace("existing pull request comment is up-to-date", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "gh_comment_id", prComment.GetID())
 				}
-			} else {
-				logger.Trace("existing pull request comment is not matched. Skipping", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber(), "comment_id", prComment.GetID())
 			}
 		}
 
