@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net/http"
@@ -1332,10 +1333,12 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 				lineNumberStr = fmt.Sprintf("%d", discussionPosition.OldLine)
 			}
 
+			ghLink := generateGithubDiffLink(githubDomain, p.githubPath[0], p.githubPath[1], discussionPosition)
+
 			if discussionPosition.OldPath == discussionPosition.NewPath {
-				discussionDiffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s` (lineno `%s`) |", discussionPosition.OldPath, lineNumberStr)
+				discussionDiffNoteRow = fmt.Sprintf("\n> | **Diff Note** | [`%s` (lineno `%s`)](%s) |", discussionPosition.OldPath, lineNumberStr, ghLink)
 			} else {
-				discussionDiffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s` -> `%s` (lineno `%s`) |", discussionPosition.OldPath, discussionPosition.NewPath, lineNumberStr)
+				discussionDiffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s` -> `%s` (lineno `%s`)](%s) |", discussionPosition.OldPath, discussionPosition.NewPath, lineNumberStr, ghLink)
 			}
 		}
 
@@ -1366,10 +1369,12 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 					lineNumberStr = fmt.Sprintf("%d", comment.Position.OldLine)
 				}
 
+				ghLink := generateGithubDiffLink(githubDomain, p.githubPath[0], p.githubPath[1], comment.Position)
+
 				if comment.Position.OldPath == comment.Position.NewPath {
-					diffNoteRow = fmt.Sprintf("\n`%s` (lineno `%s`)", comment.Position.OldPath, lineNumberStr)
+					diffNoteRow = fmt.Sprintf("\n[`%s` (lineno `%s`)](%s)", comment.Position.OldPath, lineNumberStr, ghLink)
 				} else {
-					diffNoteRow = fmt.Sprintf("\n`%s` -> `%s` (lineno `%s`)", comment.Position.OldPath, comment.Position.NewPath, lineNumberStr)
+					diffNoteRow = fmt.Sprintf("\n[`%s` -> `%s` (lineno `%s`)](%s)", comment.Position.OldPath, comment.Position.NewPath, lineNumberStr, ghLink)
 				}
 			}
 
@@ -1475,10 +1480,12 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 				lineNumberStr = fmt.Sprintf("%d", comment.Position.OldLine)
 			}
 
+			ghLink := generateGithubDiffLink(githubDomain, p.githubPath[0], p.githubPath[1], comment.Position)
+
 			if comment.Position.OldPath == comment.Position.NewPath {
-				diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s` (lineno `%s`) |", comment.Position.OldPath, lineNumberStr)
+				diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | [`%s` (lineno `%s`)](%s) |", comment.Position.OldPath, lineNumberStr, ghLink)
 			} else {
-				diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | `%s` -> `%s` (lineno `%s`) |", comment.Position.OldPath, comment.Position.NewPath, lineNumberStr)
+				diffNoteRow = fmt.Sprintf("\n> | **Diff Note** | [`%s` -> `%s` (lineno `%s`)](%s) |", comment.Position.OldPath, comment.Position.NewPath, lineNumberStr, ghLink)
 			}
 		}
 
@@ -1528,4 +1535,25 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 	}
 
 	return true, nil
+}
+
+func generateGithubDiffLink(githubDomain, repoOwner, repoName string, position *gitlab.NotePosition) string {
+	var filepath string
+	var lineNumber int
+	var lineType string // "L" for old line, "R" for new line
+
+	if position.NewLine != 0 {
+		filepath = position.NewPath
+		lineNumber = position.NewLine
+		lineType = "R"
+	} else {
+		filepath = position.OldPath
+		lineNumber = position.OldLine
+		lineType = "L"
+	}
+
+	hash := sha256.Sum256([]byte(filepath))
+	diffHash := fmt.Sprintf("%x", hash)
+
+	return fmt.Sprintf("https://%s/%s/%s/compare/%s...%s#diff-%s%s%d", githubDomain, repoOwner, repoName, position.BaseSHA, position.HeadSHA, diffHash, lineType, lineNumber)
 }
