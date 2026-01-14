@@ -816,6 +816,56 @@ func (p *project) createEmptyPullRequest(ctx context.Context, mergeRequestIID in
 	return true, nil
 }
 
+func (p *project) migrateTextBody(textBody string, mergeRequestIID int) string {
+	// Extract @mentions and backtick them.
+	// This prevents GitLab @mentions being confused as GitHub @mentions.
+	mentionRegex := regexp.MustCompile(`@([a-zA-Z0-9_-]+)`)
+	textBody = mentionRegex.ReplaceAllStringFunc(textBody, func(match string) string {
+		// extract the @mention
+		submatches := mentionRegex.FindStringSubmatch(match)
+		if len(submatches) == 2 {
+			mention := submatches[1]
+			backtickedMention := fmt.Sprintf("`@%s`", mention)
+			logger.Debug("backticking @mention", "merge_request_id", mergeRequestIID, "mention", mention, "backticked_mention", backtickedMention)
+			return backtickedMention
+		}
+		return match
+	})
+
+	// Extract #issue-number and backtick them.
+	// This prevents GitLab issue references being confused as GitHub issue/pr references.
+	issueNumberRegex := regexp.MustCompile(`#(\d+)`)
+	textBody = issueNumberRegex.ReplaceAllStringFunc(textBody, func(match string) string {
+		submatches := issueNumberRegex.FindStringSubmatch(match)
+		if len(submatches) == 2 {
+			issueNumber := submatches[1]
+			backtickedIssueNumber := fmt.Sprintf("`#%s`", issueNumber)
+			logger.Debug("backticking issue number", "merge_request_id", mergeRequestIID, "issue_number", issueNumber, "backticked_issue_number", backtickedIssueNumber)
+			return backtickedIssueNumber
+		}
+		return match
+	})
+
+	// Convert markdown image links from /uploads/... to domain/uploads/...
+	// Pattern: ![alt text](/uploads/path/to/file.png)
+	imageLinkRegex := regexp.MustCompile(`!\[([^\]]*)\]\((/uploads/[^)]+)\)`)
+	textBody = imageLinkRegex.ReplaceAllStringFunc(textBody, func(match string) string {
+		// Extract the alt text and path
+		submatches := imageLinkRegex.FindStringSubmatch(match)
+		if len(submatches) == 3 {
+			altText := submatches[1]
+			uploadPath := submatches[2]
+			// we don't display as image but just a link because the imageHostingDomain is private
+			newLink := fmt.Sprintf("[%s](%s%s)", altText, imageHostingDomain, uploadPath)
+			logger.Debug("converting image link", "merge_request_id", mergeRequestIID, "old", match, "new", newLink)
+			return newLink
+		}
+		return match
+	})
+
+	return textBody
+}
+
 func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.MergeRequest) (bool, error) {
 	// Check for context cancellation
 	if err := ctx.Err(); err != nil {
@@ -1043,9 +1093,7 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 		}
 	}
 
-	// this prevents GitLab issue references being confused as GitHub issue/pr references
-	// also prevents on-prem@mentions linked wrongly in the description
-	description := strings.ReplaceAll(strings.ReplaceAll(mergeRequest.Description, "#", "#!"), "@", "@!")
+	description := p.migrateTextBody(mergeRequest.Description, mergeRequest.IID)
 	if strings.TrimSpace(description) == "" {
 		description = "_No description_"
 	}
@@ -1181,6 +1229,10 @@ func (p *project) migrateMergeRequest(ctx context.Context, mergeRequest *gitlab.
 		} else {
 			logger.Trace("existing pull request is up-to-date", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber())
 		}
+	}
+
+	if skipMigratingComments {
+		return true, nil
 	}
 
 	/*********************************************************
@@ -1356,7 +1408,7 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 				}
 			}
 
-			glCommentBodyStr := strings.ReplaceAll(strings.ReplaceAll(comment.Body, "#", "#!"), "@", "@!")
+			glCommentBodyStr := p.migrateTextBody(comment.Body, mergeRequest.IID)
 
 			diffNoteRow := ""
 			if !positionIsTheSame && comment.Position != nil {
@@ -1467,7 +1519,7 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 			}
 		}
 
-		glCommentBodyStr := strings.ReplaceAll(strings.ReplaceAll(comment.Body, "#", "#!"), "@", "@!")
+		glCommentBodyStr := p.migrateTextBody(comment.Body, mergeRequest.IID)
 
 		diffNoteRow := ""
 		if comment.Position != nil {

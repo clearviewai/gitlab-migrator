@@ -24,14 +24,16 @@ import (
 )
 
 const (
-	dateFormat          = time.RFC3339
-	defaultGithubDomain = "github.com"
-	defaultGitlabDomain = "gitlab.com"
+	dateFormat                = time.RFC3339
+	defaultGithubDomain       = "github.com"
+	defaultGitlabDomain       = "gitlab.com"
+	defaultImageHostingDomain = "https://gitlab.com"
 )
 
 var loop, report bool
-var deleteExistingRepos, enablePullRequests, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches bool
+var deleteExistingRepos, enablePullRequests, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches, skipMigratingComments bool
 var githubDomain, githubRepo, githubToken, githubUser, gitlabDomain, gitlabProject, gitlabToken, projectsCsvPath, renameTrunkBranch string
+var imageHostingDomain string
 var mergeRequestsAge int
 
 var (
@@ -99,6 +101,7 @@ func main() {
 	flag.BoolVar(&renameMasterToMain, "rename-master-to-main", false, "rename master branch to main and update pull requests (incompatible with -rename-trunk-branch)")
 	flag.BoolVar(&skipInvalidMergeRequests, "skip-invalid-merge-requests", false, "when true, will log and skip invalid merge requests instead of raising an error")
 	flag.BoolVar(&trimGithubBranches, "trim-branches-on-github", false, "when true, will delete any branches on GitHub that are no longer present in GitLab")
+	flag.BoolVar(&skipMigratingComments, "skip-migrating-comments", false, "when true, will skip migrating comments")
 	flag.BoolVar(&showVersion, "version", false, "output version information")
 
 	flag.StringVar(&githubDomain, "github-domain", defaultGithubDomain, "specifies the GitHub domain to use")
@@ -109,6 +112,7 @@ func main() {
 	flag.StringVar(&projectsCsvPath, "projects-csv", "", "specifies the path to a CSV file describing projects to migrate (incompatible with -gitlab-project and -github-repo)")
 	flag.StringVar(&mergeRequestsAgeRaw, "merge-requests-max-age", "", "optional maximum age in days of merge requests to migrate")
 	flag.StringVar(&renameTrunkBranch, "rename-trunk-branch", "", "specifies the new trunk branch name (incompatible with -rename-master-to-main)")
+	flag.StringVar(&imageHostingDomain, "image-hosting-domain", defaultImageHostingDomain, "specifies the domain to use for image hosting in future")
 
 	flag.IntVar(&maxConcurrency, "max-concurrency", 4, "how many projects to migrate in parallel")
 
