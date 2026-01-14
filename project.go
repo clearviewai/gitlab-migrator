@@ -85,7 +85,7 @@ func (p *project) createRepo(ctx context.Context, homepage string, repoDeleted b
 }
 
 func (p *project) migrate(ctx context.Context) error {
-	if enablePullRequests && onlyMigrateComments {
+	if onlyMigrateComments {
 		logger.Info("only migrating comments from GitLab to GitHub and skipping repository migration", "name", p.gitlabPath[1], "group", p.gitlabPath[0])
 		p.migrateMergeRequests(ctx, nil)
 		return nil
@@ -291,7 +291,7 @@ func (p *project) migrateMergeRequests(ctx context.Context, mergeRequestIDs *[]i
 	}
 
 	maxMergeRequestNumber := 0
-	logger.Debug("retrieving GitLab merge requests", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID)
+	logger.Info("retrieving GitLab merge requests", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID)
 	nPages := 0
 	for {
 		result, resp, err := gl.MergeRequests.ListProjectMergeRequests(p.project.ID, opts)
@@ -314,7 +314,7 @@ func (p *project) migrateMergeRequests(ctx context.Context, mergeRequestIDs *[]i
 
 		opts.Page = resp.NextPage
 	}
-	logger.Debug("retrieved merge requests", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "count", len(mergeRequests), "n_pages", nPages)
+	logger.Info("retrieved merge requests", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "count", len(mergeRequests), "n_pages", nPages)
 
 	if mergeRequestIDs == nil {
 		ids := make([]int, maxMergeRequestNumber)
@@ -331,7 +331,7 @@ func (p *project) migrateMergeRequests(ctx context.Context, mergeRequestIDs *[]i
 	totalCount := len(*mergeRequestIDs)
 
 	if onlyMigrateComments {
-		logger.Info("migrating merge request comments from GitLab to GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "count", totalCount)
+		logger.Info("migrating merge request comments from GitLab to GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "count", totalCount, "max_concurrency", maxConcurrencyForComments)
 
 		type migrationResult struct {
 			ok  bool
@@ -963,7 +963,7 @@ func (p *project) migrateMergeRequestWithoutComments(ctx context.Context, mergeR
 			(pullRequest.Draft == nil || *pullRequest.Draft != mergeRequest.Draft) {
 			logger.Info("updating pull request", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber())
 
-			pullRequest.Title = &mergeRequest.Title
+			pullRequest.Title = &title
 			pullRequest.Body = &body
 			pullRequest.Draft = &mergeRequest.Draft
 			pullRequest.MaintainerCanModify = nil
@@ -1422,18 +1422,6 @@ func (p *project) getMergeRequestCommits(ctx context.Context, mergeRequest *gitl
 		mergeRequestCommits = []*gitlab.Commit{commit2GitlabCommit(commit)}
 	}
 
-	// override for edge cases
-	if mergeRequest.IID == 1704 {
-		// pre-receive hook declined
-		logger.Warn("override for edge case - create empty commit", "merge_request_id", mergeRequest.IID)
-		commit, err := p.createEmptyCommit()
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		startCommit = commit
-		endCommit = commit
-		mergeRequestCommits = []*gitlab.Commit{commit2GitlabCommit(commit)}
-	}
 	return mergeRequestCommits, startCommit, endCommit, nil
 }
 

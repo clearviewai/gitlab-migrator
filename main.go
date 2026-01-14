@@ -102,8 +102,8 @@ func main() {
 	flag.BoolVar(&renameMasterToMain, "rename-master-to-main", false, "rename master branch to main and update pull requests (incompatible with -rename-trunk-branch)")
 	flag.BoolVar(&skipInvalidMergeRequests, "skip-invalid-merge-requests", false, "when true, will log and skip invalid merge requests instead of raising an error")
 	flag.BoolVar(&trimGithubBranches, "trim-branches-on-github", false, "when true, will delete any branches on GitHub that are no longer present in GitLab")
-	flag.BoolVar(&skipMigratingComments, "skip-migrating-comments", false, "when true, will skip migrating comments")
-	flag.BoolVar(&onlyMigrateComments, "only-migrate-comments", false, "when true, will only migrate comments")
+	flag.BoolVar(&skipMigratingComments, "skip-migrating-comments", false, "when true, will skip migrating comments - used only when migrate-pull-requests is set and only-migrate-comments is not set")
+	flag.BoolVar(&onlyMigrateComments, "only-migrate-comments", false, "when true, will only migrate comments - if set, please also set migrate-pull-requests")
 	flag.BoolVar(&showVersion, "version", false, "output version information")
 
 	flag.StringVar(&githubDomain, "github-domain", defaultGithubDomain, "specifies the GitHub domain to use")
@@ -117,7 +117,7 @@ func main() {
 	flag.StringVar(&imageHostingDomain, "image-hosting-domain", defaultImageHostingDomain, "specifies the domain to use for image hosting in future")
 
 	flag.IntVar(&maxConcurrency, "max-concurrency", 4, "how many projects to migrate in parallel")
-	flag.IntVar(&maxConcurrencyForComments, "max-concurrency-for-comments", 4, "how many merge request comments to migrate in parallel")
+	flag.IntVar(&maxConcurrencyForComments, "max-concurrency-for-comments", 4, "how many merge request comments to migrate in parallel - used only when only-migrate-comments is set")
 
 	flag.Parse()
 
