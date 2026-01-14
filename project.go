@@ -85,6 +85,12 @@ func (p *project) createRepo(ctx context.Context, homepage string, repoDeleted b
 }
 
 func (p *project) migrate(ctx context.Context) error {
+	if enablePullRequests && onlyMigrateComments {
+		logger.Info("only migrating comments from GitLab to GitHub and skipping repository migration", "name", p.gitlabPath[1], "group", p.gitlabPath[0])
+		p.migrateMergeRequests(ctx, nil)
+		return nil
+	}
+
 	cloneUrl, err := url.Parse(p.project.HTTPURLToRepo)
 	if err != nil {
 		return fmt.Errorf("parsing clone URL: %v", err)
@@ -424,6 +430,7 @@ func (p *project) migrateMergeRequests(ctx context.Context, mergeRequestIDs *[]i
 
 	logger.Info("migrated merge requests from GitLab to GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "successful", successCount, "failed", failureCount, "skipped", skippedCount)
 }
+
 func (p *project) createEmptyPullRequest(ctx context.Context, mergeRequestIID int) (bool, error) {
 	// Check for context cancellation
 	if err := ctx.Err(); err != nil {
@@ -787,9 +794,9 @@ func (p *project) migrateMergeRequestWithoutComments(ctx context.Context, mergeR
 	author, err := getGitlabUser(mergeRequest.Author.Username)
 	if err == nil {
 		// logger.Trace("GitLab full user for author", "author", author)
-		mergeRequestAuthorStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", mergeRequest.Author.Name, mergeRequest.Author.Username, author.Email)
+		mergeRequestAuthorStr = fmt.Sprintf("[%s (`@%s`)](mailto:%s)", mergeRequest.Author.Name, mergeRequest.Author.Username, author.Email)
 	} else {
-		mergeRequestAuthorStr = fmt.Sprintf("%s (@!%s)", mergeRequest.Author.Name, mergeRequest.Author.Username)
+		mergeRequestAuthorStr = fmt.Sprintf("%s (`@%s`)", mergeRequest.Author.Name, mergeRequest.Author.Username)
 	}
 
 	logger.Debug("determining merge request approvers", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
@@ -824,9 +831,9 @@ func (p *project) migrateMergeRequestWithoutComments(ctx context.Context, mergeR
 				approverUser, err := getGitlabUser(u.Username)
 				if err == nil {
 					// logger.Trace("GitLab full user for approver", "approver", approverUser)
-					approverStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", u.Name, u.Username, approverUser.Email)
+					approverStr = fmt.Sprintf("[%s (`@%s`)](mailto:%s)", u.Name, u.Username, approverUser.Email)
 				} else {
-					approverStr = fmt.Sprintf("%s (@!%s)", u.Name, u.Username)
+					approverStr = fmt.Sprintf("%s (`@%s`)", u.Name, u.Username)
 				}
 
 				approvers = append(approvers, approverStr)
@@ -852,10 +859,7 @@ func (p *project) migrateMergeRequestWithoutComments(ctx context.Context, mergeR
 		closeDateRow = fmt.Sprintf("\n> | **Time Originally Merged** | %s |", mergeRequest.MergedAt.Format(dateFormat))
 	}
 
-	mergeRequestTitle := mergeRequest.Title
-	if len(mergeRequestTitle) > 40 {
-		mergeRequestTitle = mergeRequestTitle[:40] + "..."
-	}
+	title := fmt.Sprintf("%s - %s", mergeRequest.Title, mergeRequest.Author.Name)
 
 	mergeOrCloseNote := ""
 	if strings.EqualFold(mergeRequest.State, "merged") {
@@ -902,7 +906,7 @@ func (p *project) migrateMergeRequestWithoutComments(ctx context.Context, mergeR
 
 	if pullRequest == nil {
 		newPullRequest := github.NewPullRequest{
-			Title:               &mergeRequest.Title,
+			Title:               &title,
 			Head:                &mergeRequest.SourceBranch,
 			Base:                &mergeRequest.TargetBranch,
 			Body:                &body,
@@ -1131,13 +1135,13 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 		for _, comment := range discussion.Notes {
 			commentAuthorStr := ""
 			if comment.Author.Email != "" {
-				commentAuthorStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", comment.Author.Name, comment.Author.Username, comment.Author.Email)
+				commentAuthorStr = fmt.Sprintf("[%s (`@%s`)](mailto:%s)", comment.Author.Name, comment.Author.Username, comment.Author.Email)
 			} else {
 				commentAuthor, err := getGitlabUser(comment.Author.Username)
 				if err == nil {
-					commentAuthorStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", comment.Author.Name, comment.Author.Username, commentAuthor.Email)
+					commentAuthorStr = fmt.Sprintf("[%s (`@%s`)](mailto:%s)", comment.Author.Name, comment.Author.Username, commentAuthor.Email)
 				} else {
-					commentAuthorStr = fmt.Sprintf("%s (@!%s)", comment.Author.Name, comment.Author.Username)
+					commentAuthorStr = fmt.Sprintf("%s (`@%s`)", comment.Author.Name, comment.Author.Username)
 				}
 			}
 
@@ -1242,13 +1246,13 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 	for _, comment := range strayComments {
 		commentAuthorStr := ""
 		if comment.Author.Email != "" {
-			commentAuthorStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", comment.Author.Name, comment.Author.Username, comment.Author.Email)
+			commentAuthorStr = fmt.Sprintf("[%s (`@%s`)](mailto:%s)", comment.Author.Name, comment.Author.Username, comment.Author.Email)
 		} else {
 			commentAuthor, err := getGitlabUser(comment.Author.Username)
 			if err == nil {
-				commentAuthorStr = fmt.Sprintf("[%s (@%s)](mailto:%s)", comment.Author.Name, comment.Author.Username, commentAuthor.Email)
+				commentAuthorStr = fmt.Sprintf("[%s (`@%s`)](mailto:%s)", comment.Author.Name, comment.Author.Username, commentAuthor.Email)
 			} else {
-				commentAuthorStr = fmt.Sprintf("%s (@!%s)", comment.Author.Name, comment.Author.Username)
+				commentAuthorStr = fmt.Sprintf("%s (`@%s`)", comment.Author.Name, comment.Author.Username)
 			}
 		}
 
