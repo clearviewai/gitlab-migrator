@@ -424,293 +424,6 @@ func (p *project) migrateMergeRequests(ctx context.Context, mergeRequestIDs *[]i
 
 	logger.Info("migrated merge requests from GitLab to GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "successful", successCount, "failed", failureCount, "skipped", skippedCount)
 }
-
-func (p *project) getMergeRequestCommits(ctx context.Context, mergeRequest *gitlab.MergeRequest) ([]*gitlab.Commit, *object.Commit, *object.Commit, error) {
-	logger.Trace("retrieving commits for merge request", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
-	var mergeRequestCommits []*gitlab.Commit
-	opts := &gitlab.GetMergeRequestCommitsOptions{
-		OrderBy: "created_at",
-		Sort:    "asc",
-		PerPage: 100,
-	}
-	nPages := 0
-	for {
-		result, resp, err := gl.MergeRequests.GetMergeRequestCommits(p.project.ID, mergeRequest.IID, opts)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("retrieving merge request commits: %v", err)
-		}
-
-		mergeRequestCommits = append(mergeRequestCommits, result...)
-
-		nPages++
-		if resp.NextPage == 0 {
-			break
-		}
-
-		opts.Page = resp.NextPage
-	}
-	logger.Info("retrieved merge request commits", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "count", len(mergeRequestCommits), "n_pages", nPages)
-
-	var startCommit, endCommit *object.Commit
-	// Some merge requests have no commits, create an empty commit instead
-	if len(mergeRequestCommits) == 0 {
-		logger.Debug("merge request has no commits, creating empty commit", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
-		commit, err := p.createEmptyCommit()
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		startCommit = commit
-		endCommit = commit
-		mergeRequestCommits = []*gitlab.Commit{commit2GitlabCommit(commit)}
-	} else {
-		// API is buggy, ordering is not respected, so we'll reorder by commit datestamp
-		sort.Slice(mergeRequestCommits, func(i, j int) bool {
-			// return mergeRequestCommits[i].CommittedDate.Before(*mergeRequestCommits[j].CommittedDate) // sometimes the commits have the same commited timestamp
-			return mergeRequestCommits[i].AuthoredDate.Before(*mergeRequestCommits[j].AuthoredDate)
-		})
-
-		if mergeRequestCommits[0] == nil {
-			return nil, nil, nil, fmt.Errorf("start commit for merge request %d is nil", mergeRequest.IID)
-		}
-		if mergeRequestCommits[len(mergeRequestCommits)-1] == nil {
-			return nil, nil, nil, fmt.Errorf("end commit for merge request %d is nil", mergeRequest.IID)
-		}
-
-		var fetchedCommits []*object.Commit
-		// reverse commits during range iteration to start from the last commit
-		// this saves many fetches because fetching the last commit will fetch all the parents
-		for i := len(mergeRequestCommits) - 1; i >= 0; i-- {
-			commit := mergeRequestCommits[i]
-			logger.Trace("commit", "id", commit.ID, "shortId", commit.ShortID, "authoredDate", commit.AuthoredDate, "committedDate", commit.CommittedDate)
-			// logger.Trace("  parentIDs", "parentIDs", commit.ParentIDs) // this ends up to be an empty array for squashed commits
-
-			fetchedCommit, fetchErr := p.fetchCommitFromRemote(ctx, commit.ID)
-			if fetchErr != nil || fetchedCommit == nil {
-				return nil, nil, nil, fmt.Errorf("fetching commit %s: %v", commit.ID, fetchErr)
-			}
-			logger.Trace("fetchedCommit", "hash", fetchedCommit.Hash, "parentHashes", fetchedCommit.ParentHashes)
-			fetchedCommits = append(fetchedCommits, fetchedCommit)
-		}
-
-		// endCommit is the head commit, startCommit is the tail commit, but parent of the startCommit is the root on the target branch
-		endCommit, startCommit = findHeadAndTailCommits(fetchedCommits)
-		if endCommit == nil || startCommit == nil {
-			// fallback to using the first and last commits from the merge request
-			logger.Warn("no head or tail commit found in fetched commits", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
-			var err error
-			startCommit, err = object.GetCommit(p.repo.Storer, plumbing.NewHash(mergeRequestCommits[0].ID))
-			if err != nil {
-				return nil, nil, nil, fmt.Errorf("loading start commit %s (merge request %d): commit exists in GitLab but not in cloned repository: %v", startCommit.Hash, mergeRequest.IID, err)
-			}
-			endCommit, err = object.GetCommit(p.repo.Storer, plumbing.NewHash(mergeRequestCommits[len(mergeRequestCommits)-1].ID))
-			if err != nil {
-				return nil, nil, nil, fmt.Errorf("loading end commit %s (merge request %d): commit exists in GitLab but not in cloned repository: %v", endCommit.Hash, mergeRequest.IID, err)
-			}
-		}
-	}
-
-	if startCommit.NumParents() == 0 {
-		// Orphaned commit, we cannot open a pull request as GitHub rejects it
-		logger.Debug("merge request has orphaned commits, creating empty commit instead", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
-		commit, err := p.createEmptyCommit()
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		startCommit = commit
-		endCommit = commit
-		mergeRequestCommits = []*gitlab.Commit{commit2GitlabCommit(commit)}
-	}
-
-	return mergeRequestCommits, startCommit, endCommit, nil
-}
-
-// fetchCommitFromRemote fetches a commit directly by SHA from the GitLab remote
-// Equivalent to: git fetch origin <commit-sha>
-func (p *project) fetchCommitFromRemote(ctx context.Context, commitID string) (*object.Commit, error) {
-	commitHash := plumbing.NewHash(commitID)
-
-	// First check if commit already exists
-	commit, err := object.GetCommit(p.repo.Storer, commitHash)
-	if err == nil {
-		logger.Trace("  commit already exists in local repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "sha", commitID)
-		return commit, nil
-	}
-
-	gitlabRemote, err := p.repo.Remote("gitlab")
-	if err != nil {
-		return nil, fmt.Errorf("getting gitlab remote: %v", err)
-	}
-
-	logger.Trace("  fetching commit directly by SHA from remote", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "sha", commitID)
-
-	// Fetch the commit directly by SHA (GitLab supports this)
-	refSpec := config.RefSpec(fmt.Sprintf("%s:refs/remotes/gitlab/%s", commitID, commitID))
-	if err := gitlabRemote.FetchContext(ctx, &git.FetchOptions{
-		RefSpecs: []config.RefSpec{refSpec},
-		Depth:    0,
-	}); err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
-		return nil, fmt.Errorf("fetching commit %s directly from remote: %v", commitID, err)
-	}
-
-	// Verify the commit is now available
-	commit, err = object.GetCommit(p.repo.Storer, commitHash)
-	if err != nil {
-		return nil, fmt.Errorf("commit %s still not found after fetch: %v", commitID, err)
-	}
-
-	logger.Trace("  successfully fetched commit from remote", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "sha", commitID)
-	return commit, nil
-}
-
-func (p *project) createEmptyCommit() (*object.Commit, error) {
-	// Resolve the default branch to get the parent commit
-	targetHash, err := p.repo.ResolveRevision(plumbing.Revision(p.defaultBranch))
-	if err != nil {
-		return nil, fmt.Errorf("resolving default branch %s: %v", p.defaultBranch, err)
-	}
-
-	// Get the parent commit directly from the storer
-	parentCommit, err := object.GetCommit(p.repo.Storer, *targetHash)
-	if err != nil {
-		return nil, fmt.Errorf("getting parent commit: %v", err)
-	}
-
-	// Create an empty commit by using the same tree as the parent
-	now := time.Now()
-	commitObj := &object.Commit{
-		Author: object.Signature{
-			Name:  "GitLab Migrator",
-			Email: "gitlab-migrator",
-			When:  now,
-		},
-		Committer: object.Signature{
-			Name:  "GitLab Migrator",
-			Email: "gitlab-migrator",
-			When:  now,
-		},
-		Message:      "Empty commit for empty merge request",
-		TreeHash:     parentCommit.TreeHash,
-		ParentHashes: []plumbing.Hash{parentCommit.Hash},
-	}
-
-	// Encode and store the commit using the storer
-	obj := p.repo.Storer.NewEncodedObject()
-	if err := commitObj.Encode(obj); err != nil {
-		return nil, fmt.Errorf("encoding commit: %v", err)
-	}
-	commitHash, err := p.repo.Storer.SetEncodedObject(obj)
-	if err != nil {
-		return nil, fmt.Errorf("saving empty commit: %v", err)
-	}
-
-	// Get the commit object to extract metadata
-	createdCommit, err := object.GetCommit(p.repo.Storer, commitHash)
-	if err != nil {
-		return nil, fmt.Errorf("retrieving created commit: %v", err)
-	}
-
-	logger.Debug("created empty commit", "sha", createdCommit.Hash)
-	return createdCommit, nil
-}
-
-func commit2GitlabCommit(commit *object.Commit) *gitlab.Commit {
-	return &gitlab.Commit{
-		ID:            commit.Hash.String(),
-		ShortID:       commit.Hash.String()[:8], // gitlab wants 8 as short hash
-		Title:         commit.Message,
-		AuthorName:    commit.Author.Name,
-		AuthorEmail:   commit.Author.Email,
-		AuthoredDate:  &commit.Author.When,
-		CommittedDate: &commit.Author.When,
-	}
-}
-
-// findHeadAndTailCommits analyzes a set of commits and identifies the head commit
-// (not a parent of any other commit) and tail commit (parent not in the set).
-// in a merge request, there should be only one head commit and one tail commit.
-func findHeadAndTailCommits(commits []*object.Commit) (headCommit, tailCommit *object.Commit) {
-	if len(commits) == 0 {
-		return nil, nil
-	}
-
-	// Build maps and sets in a single pass
-	commitHashes := make(map[plumbing.Hash]bool)
-	parentHashes := make(map[plumbing.Hash]bool)
-
-	for _, commit := range commits {
-		commitHashes[commit.Hash] = true
-		for _, parentHash := range commit.ParentHashes {
-			parentHashes[parentHash] = true
-		}
-	}
-
-	var headCommits []*object.Commit
-	var tailCommits []*object.Commit
-	// Find head and tail commits in a single pass
-	for _, commit := range commits {
-		// Check if this is a head commit (not a parent of any other commit)
-		if !parentHashes[commit.Hash] {
-			logger.Trace("found head commit", "hash", commit.Hash)
-			headCommits = append(headCommits, commit)
-		}
-
-		// Check if this is a tail commit (parent(s) not in this set)
-		isTail := true
-		// if any parent is in the set, it's not a tail commit
-		// this should be largely true - can reexamine later
-		for _, parentHash := range commit.ParentHashes {
-			if commitHashes[parentHash] {
-				isTail = false
-				break
-			}
-		}
-		if isTail {
-			tailCommits = append(tailCommits, commit)
-			logger.Trace("found tail commit", "hash", commit.Hash)
-		}
-	}
-
-	// Select head commit from collected head commits
-	if len(headCommits) == 0 {
-		headCommit = nil
-	} else if len(headCommits) == 1 {
-		headCommit = headCommits[0]
-	} else {
-		// Multiple head commits found, pick the one with the latest creation date
-		logger.Warn("multiple head commits found", "count", len(headCommits), "commits", headCommits)
-
-		// Find the commit with the latest Author.When (creation date)
-		headCommit = headCommits[0]
-		for _, c := range headCommits[1:] {
-			if c.Author.When.After(headCommit.Author.When) {
-				headCommit = c
-			}
-		}
-		logger.Trace("selected latest head commit", "hash", headCommit.Hash, "author_date", headCommit.Author.When)
-	}
-
-	// Select tail commit from collected tail commits
-	if len(tailCommits) == 0 {
-		tailCommit = nil
-	} else if len(tailCommits) == 1 {
-		tailCommit = tailCommits[0]
-	} else {
-		// Multiple tail commits found, pick the one with the earliest creation date
-		logger.Warn("multiple tail commits found", "count", len(tailCommits), "commits", tailCommits)
-
-		// Find the commit with the earliest Author.When (creation date)
-		tailCommit = tailCommits[0]
-		for _, c := range tailCommits[1:] {
-			if c.Author.When.Before(tailCommit.Author.When) {
-				tailCommit = c
-			}
-		}
-		logger.Trace("selected earliest tail commit", "hash", tailCommit.Hash, "author_date", tailCommit.Author.When)
-	}
-
-	return headCommit, tailCommit
-}
-
 func (p *project) createEmptyPullRequest(ctx context.Context, mergeRequestIID int) (bool, error) {
 	// Check for context cancellation
 	if err := ctx.Err(); err != nil {
@@ -935,56 +648,6 @@ func (p *project) fetchPullRequest(ctx context.Context, mergeRequest *gitlab.Mer
 		}
 	}
 	return pullRequest, nil
-}
-
-func (p *project) migrateTextBody(textBody string, mergeRequestIID int) string {
-	// Extract @mentions and backtick them.
-	// This prevents GitLab @mentions being confused as GitHub @mentions.
-	mentionRegex := regexp.MustCompile(`@([a-zA-Z0-9_-]+)`)
-	textBody = mentionRegex.ReplaceAllStringFunc(textBody, func(match string) string {
-		// extract the @mention
-		submatches := mentionRegex.FindStringSubmatch(match)
-		if len(submatches) == 2 {
-			mention := submatches[1]
-			backtickedMention := fmt.Sprintf("`@%s`", mention)
-			logger.Debug("backticking @mention", "merge_request_id", mergeRequestIID, "mention", mention, "backticked_mention", backtickedMention)
-			return backtickedMention
-		}
-		return match
-	})
-
-	// Extract #issue-number and backtick them.
-	// This prevents GitLab issue references being confused as GitHub issue/pr references.
-	issueNumberRegex := regexp.MustCompile(`#(\d+)`)
-	textBody = issueNumberRegex.ReplaceAllStringFunc(textBody, func(match string) string {
-		submatches := issueNumberRegex.FindStringSubmatch(match)
-		if len(submatches) == 2 {
-			issueNumber := submatches[1]
-			backtickedIssueNumber := fmt.Sprintf("`#%s`", issueNumber)
-			logger.Debug("backticking issue number", "merge_request_id", mergeRequestIID, "issue_number", issueNumber, "backticked_issue_number", backtickedIssueNumber)
-			return backtickedIssueNumber
-		}
-		return match
-	})
-
-	// Convert markdown image links from /uploads/... to domain/uploads/...
-	// Pattern: ![alt text](/uploads/path/to/file.png)
-	imageLinkRegex := regexp.MustCompile(`!\[([^\]]*)\]\((/uploads/[^)]+)\)`)
-	textBody = imageLinkRegex.ReplaceAllStringFunc(textBody, func(match string) string {
-		// Extract the alt text and path
-		submatches := imageLinkRegex.FindStringSubmatch(match)
-		if len(submatches) == 3 {
-			altText := submatches[1]
-			uploadPath := submatches[2]
-			// we don't display as image but just a link because the imageHostingDomain is private
-			newLink := fmt.Sprintf("[%s](%s%s)", altText, imageHostingDomain, uploadPath)
-			logger.Debug("converting image link", "merge_request_id", mergeRequestIID, "old", match, "new", newLink)
-			return newLink
-		}
-		return match
-	})
-
-	return textBody
 }
 
 func (p *project) migrateMergeRequestWithoutComments(ctx context.Context, mergeRequest *gitlab.MergeRequest, pullRequest *github.PullRequest) (bool, error) {
@@ -1657,6 +1320,354 @@ func (p *project) migrateMergeRequestComments(ctx context.Context, mergeRequest 
 	}
 
 	return true, nil
+}
+
+func (p *project) getMergeRequestCommits(ctx context.Context, mergeRequest *gitlab.MergeRequest) ([]*gitlab.Commit, *object.Commit, *object.Commit, error) {
+	logger.Trace("retrieving commits for merge request", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
+	var mergeRequestCommits []*gitlab.Commit
+	opts := &gitlab.GetMergeRequestCommitsOptions{
+		OrderBy: "created_at",
+		Sort:    "asc",
+		PerPage: 100,
+	}
+	nPages := 0
+	for {
+		result, resp, err := gl.MergeRequests.GetMergeRequestCommits(p.project.ID, mergeRequest.IID, opts)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("retrieving merge request commits: %v", err)
+		}
+
+		mergeRequestCommits = append(mergeRequestCommits, result...)
+
+		nPages++
+		if resp.NextPage == 0 {
+			break
+		}
+
+		opts.Page = resp.NextPage
+	}
+	logger.Info("retrieved merge request commits", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID, "count", len(mergeRequestCommits), "n_pages", nPages)
+
+	var startCommit, endCommit *object.Commit
+	// Some merge requests have no commits, create an empty commit instead
+	if len(mergeRequestCommits) == 0 {
+		logger.Debug("merge request has no commits, creating empty commit", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
+		commit, err := p.createEmptyCommit()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		startCommit = commit
+		endCommit = commit
+		mergeRequestCommits = []*gitlab.Commit{commit2GitlabCommit(commit)}
+	} else {
+		// API is buggy, ordering is not respected, so we'll reorder by commit datestamp
+		sort.Slice(mergeRequestCommits, func(i, j int) bool {
+			// return mergeRequestCommits[i].CommittedDate.Before(*mergeRequestCommits[j].CommittedDate) // sometimes the commits have the same commited timestamp
+			return mergeRequestCommits[i].AuthoredDate.Before(*mergeRequestCommits[j].AuthoredDate)
+		})
+
+		if mergeRequestCommits[0] == nil {
+			return nil, nil, nil, fmt.Errorf("start commit for merge request %d is nil", mergeRequest.IID)
+		}
+		if mergeRequestCommits[len(mergeRequestCommits)-1] == nil {
+			return nil, nil, nil, fmt.Errorf("end commit for merge request %d is nil", mergeRequest.IID)
+		}
+
+		var fetchedCommits []*object.Commit
+		// reverse commits during range iteration to start from the last commit
+		// this saves many fetches because fetching the last commit will fetch all the parents
+		for i := len(mergeRequestCommits) - 1; i >= 0; i-- {
+			commit := mergeRequestCommits[i]
+			logger.Trace("commit", "id", commit.ID, "shortId", commit.ShortID, "authoredDate", commit.AuthoredDate, "committedDate", commit.CommittedDate)
+			// logger.Trace("  parentIDs", "parentIDs", commit.ParentIDs) // this ends up to be an empty array for squashed commits
+
+			fetchedCommit, fetchErr := p.fetchCommitFromRemote(ctx, commit.ID)
+			if fetchErr != nil || fetchedCommit == nil {
+				return nil, nil, nil, fmt.Errorf("fetching commit %s: %v", commit.ID, fetchErr)
+			}
+			logger.Trace("fetchedCommit", "hash", fetchedCommit.Hash, "parentHashes", fetchedCommit.ParentHashes)
+			fetchedCommits = append(fetchedCommits, fetchedCommit)
+		}
+
+		// endCommit is the head commit, startCommit is the tail commit, but parent of the startCommit is the root on the target branch
+		endCommit, startCommit = findHeadAndTailCommits(fetchedCommits)
+		if endCommit == nil || startCommit == nil {
+			// fallback to using the first and last commits from the merge request
+			logger.Warn("no head or tail commit found in fetched commits", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
+			var err error
+			startCommit, err = object.GetCommit(p.repo.Storer, plumbing.NewHash(mergeRequestCommits[0].ID))
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("loading start commit %s (merge request %d): commit exists in GitLab but not in cloned repository: %v", startCommit.Hash, mergeRequest.IID, err)
+			}
+			endCommit, err = object.GetCommit(p.repo.Storer, plumbing.NewHash(mergeRequestCommits[len(mergeRequestCommits)-1].ID))
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("loading end commit %s (merge request %d): commit exists in GitLab but not in cloned repository: %v", endCommit.Hash, mergeRequest.IID, err)
+			}
+		}
+	}
+
+	if startCommit.NumParents() == 0 {
+		// Orphaned commit, we cannot open a pull request as GitHub rejects it
+		logger.Debug("merge request has orphaned commits, creating empty commit instead", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "merge_request_id", mergeRequest.IID)
+		commit, err := p.createEmptyCommit()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		startCommit = commit
+		endCommit = commit
+		mergeRequestCommits = []*gitlab.Commit{commit2GitlabCommit(commit)}
+	}
+
+	// override for edge cases
+	if mergeRequest.IID == 1704 {
+		// pre-receive hook declined
+		logger.Warn("override for edge case - create empty commit", "merge_request_id", mergeRequest.IID)
+		commit, err := p.createEmptyCommit()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		startCommit = commit
+		endCommit = commit
+		mergeRequestCommits = []*gitlab.Commit{commit2GitlabCommit(commit)}
+	}
+	return mergeRequestCommits, startCommit, endCommit, nil
+}
+
+// fetchCommitFromRemote fetches a commit directly by SHA from the GitLab remote
+// Equivalent to: git fetch origin <commit-sha>
+func (p *project) fetchCommitFromRemote(ctx context.Context, commitID string) (*object.Commit, error) {
+	commitHash := plumbing.NewHash(commitID)
+
+	// First check if commit already exists
+	commit, err := object.GetCommit(p.repo.Storer, commitHash)
+	if err == nil {
+		logger.Trace("  commit already exists in local repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "sha", commitID)
+		return commit, nil
+	}
+
+	gitlabRemote, err := p.repo.Remote("gitlab")
+	if err != nil {
+		return nil, fmt.Errorf("getting gitlab remote: %v", err)
+	}
+
+	logger.Trace("  fetching commit directly by SHA from remote", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "sha", commitID)
+
+	// Fetch the commit directly by SHA (GitLab supports this)
+	refSpec := config.RefSpec(fmt.Sprintf("%s:refs/remotes/gitlab/%s", commitID, commitID))
+	if err := gitlabRemote.FetchContext(ctx, &git.FetchOptions{
+		RefSpecs: []config.RefSpec{refSpec},
+		Depth:    0,
+	}); err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
+		return nil, fmt.Errorf("fetching commit %s directly from remote: %v", commitID, err)
+	}
+
+	// Verify the commit is now available
+	commit, err = object.GetCommit(p.repo.Storer, commitHash)
+	if err != nil {
+		return nil, fmt.Errorf("commit %s still not found after fetch: %v", commitID, err)
+	}
+
+	logger.Trace("  successfully fetched commit from remote", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "sha", commitID)
+	return commit, nil
+}
+
+func (p *project) createEmptyCommit() (*object.Commit, error) {
+	// Resolve the default branch to get the parent commit
+	targetHash, err := p.repo.ResolveRevision(plumbing.Revision(p.defaultBranch))
+	if err != nil {
+		return nil, fmt.Errorf("resolving default branch %s: %v", p.defaultBranch, err)
+	}
+
+	// Get the parent commit directly from the storer
+	parentCommit, err := object.GetCommit(p.repo.Storer, *targetHash)
+	if err != nil {
+		return nil, fmt.Errorf("getting parent commit: %v", err)
+	}
+
+	// Create an empty commit by using the same tree as the parent
+	now := time.Now()
+	commitObj := &object.Commit{
+		Author: object.Signature{
+			Name:  "GitLab Migrator",
+			Email: "gitlab-migrator",
+			When:  now,
+		},
+		Committer: object.Signature{
+			Name:  "GitLab Migrator",
+			Email: "gitlab-migrator",
+			When:  now,
+		},
+		Message:      "Empty commit for empty merge request",
+		TreeHash:     parentCommit.TreeHash,
+		ParentHashes: []plumbing.Hash{parentCommit.Hash},
+	}
+
+	// Encode and store the commit using the storer
+	obj := p.repo.Storer.NewEncodedObject()
+	if err := commitObj.Encode(obj); err != nil {
+		return nil, fmt.Errorf("encoding commit: %v", err)
+	}
+	commitHash, err := p.repo.Storer.SetEncodedObject(obj)
+	if err != nil {
+		return nil, fmt.Errorf("saving empty commit: %v", err)
+	}
+
+	// Get the commit object to extract metadata
+	createdCommit, err := object.GetCommit(p.repo.Storer, commitHash)
+	if err != nil {
+		return nil, fmt.Errorf("retrieving created commit: %v", err)
+	}
+
+	logger.Debug("created empty commit", "sha", createdCommit.Hash)
+	return createdCommit, nil
+}
+
+func commit2GitlabCommit(commit *object.Commit) *gitlab.Commit {
+	return &gitlab.Commit{
+		ID:            commit.Hash.String(),
+		ShortID:       commit.Hash.String()[:8], // gitlab wants 8 as short hash
+		Title:         commit.Message,
+		AuthorName:    commit.Author.Name,
+		AuthorEmail:   commit.Author.Email,
+		AuthoredDate:  &commit.Author.When,
+		CommittedDate: &commit.Author.When,
+	}
+}
+
+// findHeadAndTailCommits analyzes a set of commits and identifies the head commit
+// (not a parent of any other commit) and tail commit (parent not in the set).
+// in a merge request, there should be only one head commit and one tail commit.
+func findHeadAndTailCommits(commits []*object.Commit) (headCommit, tailCommit *object.Commit) {
+	if len(commits) == 0 {
+		return nil, nil
+	}
+
+	// Build maps and sets in a single pass
+	commitHashes := make(map[plumbing.Hash]bool)
+	parentHashes := make(map[plumbing.Hash]bool)
+
+	for _, commit := range commits {
+		commitHashes[commit.Hash] = true
+		for _, parentHash := range commit.ParentHashes {
+			parentHashes[parentHash] = true
+		}
+	}
+
+	var headCommits []*object.Commit
+	var tailCommits []*object.Commit
+	// Find head and tail commits in a single pass
+	for _, commit := range commits {
+		// Check if this is a head commit (not a parent of any other commit)
+		if !parentHashes[commit.Hash] {
+			logger.Trace("found head commit", "hash", commit.Hash)
+			headCommits = append(headCommits, commit)
+		}
+
+		// Check if this is a tail commit (parent(s) not in this set)
+		isTail := true
+		// if any parent is in the set, it's not a tail commit
+		// this should be largely true - can reexamine later
+		for _, parentHash := range commit.ParentHashes {
+			if commitHashes[parentHash] {
+				isTail = false
+				break
+			}
+		}
+		if isTail {
+			tailCommits = append(tailCommits, commit)
+			logger.Trace("found tail commit", "hash", commit.Hash)
+		}
+	}
+
+	// Select head commit from collected head commits
+	if len(headCommits) == 0 {
+		headCommit = nil
+	} else if len(headCommits) == 1 {
+		headCommit = headCommits[0]
+	} else {
+		// Multiple head commits found, pick the one with the latest creation date
+		logger.Warn("multiple head commits found", "count", len(headCommits), "commits", headCommits)
+
+		// Find the commit with the latest Author.When (creation date)
+		headCommit = headCommits[0]
+		for _, c := range headCommits[1:] {
+			if c.Author.When.After(headCommit.Author.When) {
+				headCommit = c
+			}
+		}
+		logger.Trace("selected latest head commit", "hash", headCommit.Hash, "author_date", headCommit.Author.When)
+	}
+
+	// Select tail commit from collected tail commits
+	if len(tailCommits) == 0 {
+		tailCommit = nil
+	} else if len(tailCommits) == 1 {
+		tailCommit = tailCommits[0]
+	} else {
+		// Multiple tail commits found, pick the one with the earliest creation date
+		logger.Warn("multiple tail commits found", "count", len(tailCommits), "commits", tailCommits)
+
+		// Find the commit with the earliest Author.When (creation date)
+		tailCommit = tailCommits[0]
+		for _, c := range tailCommits[1:] {
+			if c.Author.When.Before(tailCommit.Author.When) {
+				tailCommit = c
+			}
+		}
+		logger.Trace("selected earliest tail commit", "hash", tailCommit.Hash, "author_date", tailCommit.Author.When)
+	}
+
+	return headCommit, tailCommit
+}
+
+func (p *project) migrateTextBody(textBody string, mergeRequestIID int) string {
+	// Extract @mentions and backtick them.
+	// This prevents GitLab @mentions being confused as GitHub @mentions.
+	mentionRegex := regexp.MustCompile(`@([a-zA-Z0-9_-]+)`)
+	textBody = mentionRegex.ReplaceAllStringFunc(textBody, func(match string) string {
+		// extract the @mention
+		submatches := mentionRegex.FindStringSubmatch(match)
+		if len(submatches) == 2 {
+			mention := submatches[1]
+			backtickedMention := fmt.Sprintf("`@%s`", mention)
+			logger.Debug("backticking @mention", "merge_request_id", mergeRequestIID, "mention", mention, "backticked_mention", backtickedMention)
+			return backtickedMention
+		}
+		return match
+	})
+
+	// Extract #issue-number and backtick them.
+	// This prevents GitLab issue references being confused as GitHub issue/pr references.
+	issueNumberRegex := regexp.MustCompile(`#(\d+)`)
+	textBody = issueNumberRegex.ReplaceAllStringFunc(textBody, func(match string) string {
+		submatches := issueNumberRegex.FindStringSubmatch(match)
+		if len(submatches) == 2 {
+			issueNumber := submatches[1]
+			backtickedIssueNumber := fmt.Sprintf("`#%s`", issueNumber)
+			logger.Debug("backticking issue number", "merge_request_id", mergeRequestIID, "issue_number", issueNumber, "backticked_issue_number", backtickedIssueNumber)
+			return backtickedIssueNumber
+		}
+		return match
+	})
+
+	// Convert markdown image links from /uploads/... to domain/uploads/...
+	// Pattern: ![alt text](/uploads/path/to/file.png)
+	imageLinkRegex := regexp.MustCompile(`!\[([^\]]*)\]\((/uploads/[^)]+)\)`)
+	textBody = imageLinkRegex.ReplaceAllStringFunc(textBody, func(match string) string {
+		// Extract the alt text and path
+		submatches := imageLinkRegex.FindStringSubmatch(match)
+		if len(submatches) == 3 {
+			altText := submatches[1]
+			uploadPath := submatches[2]
+			// we don't display as image but just a link because the imageHostingDomain is private
+			newLink := fmt.Sprintf("[%s](%s%s)", altText, imageHostingDomain, uploadPath)
+			logger.Debug("converting image link", "merge_request_id", mergeRequestIID, "old", match, "new", newLink)
+			return newLink
+		}
+		return match
+	})
+
+	return textBody
 }
 
 func generateGithubDiffLink(githubDomain, repoOwner, repoName string, position *gitlab.NotePosition) string {
