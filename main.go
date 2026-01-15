@@ -31,7 +31,7 @@ const (
 )
 
 var loop, report bool
-var deleteExistingRepos, enablePullRequests, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches, skipMigratingComments, onlyMigrateComments bool
+var deleteExistingRepos, enablePullRequests, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches, skipMigratingComments, onlyMigratePullRequests, onlyMigrateComments bool
 var githubDomain, githubRepo, githubToken, githubUser, gitlabDomain, gitlabProject, gitlabToken, projectsCsvPath, renameTrunkBranch string
 var imageHostingDomain string
 var mergeRequestsAge int
@@ -102,8 +102,9 @@ func main() {
 	flag.BoolVar(&renameMasterToMain, "rename-master-to-main", false, "rename master branch to main and update pull requests (incompatible with -rename-trunk-branch)")
 	flag.BoolVar(&skipInvalidMergeRequests, "skip-invalid-merge-requests", false, "when true, will log and skip invalid merge requests instead of raising an error")
 	flag.BoolVar(&trimGithubBranches, "trim-branches-on-github", false, "when true, will delete any branches on GitHub that are no longer present in GitLab")
-	flag.BoolVar(&skipMigratingComments, "skip-migrating-comments", false, "when true, will skip migrating comments - used only when migrate-pull-requests is set and only-migrate-comments is not set")
-	flag.BoolVar(&onlyMigrateComments, "only-migrate-comments", false, "when true, will only migrate comments - if set, please also set migrate-pull-requests")
+	flag.BoolVar(&skipMigratingComments, "skip-migrating-comments", false, "when true, will skip migrating comments - used only when migrate-pull-requests or only-migrate-pull-requests is set, and only-migrate-comments is not set")
+	flag.BoolVar(&onlyMigratePullRequests, "only-migrate-pull-requests", false, "when true, will only migrate pull requests")
+	flag.BoolVar(&onlyMigrateComments, "only-migrate-comments", false, "when true, will only migrate comments")
 	flag.BoolVar(&showVersion, "version", false, "output version information")
 
 	flag.StringVar(&githubDomain, "github-domain", defaultGithubDomain, "specifies the GitHub domain to use")

@@ -186,54 +186,28 @@ func (p *project) migrate(ctx context.Context) error {
 		return fmt.Errorf("adding github remote: %v", err)
 	}
 
-	logger.Debug("determining branches to push", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
-	branches, err := p.repo.Branches()
-	if err != nil {
-		return fmt.Errorf("retrieving branches: %v", err)
-	}
-
-	gitlabBranches := make(map[string]bool, 0)
-	refSpecs := make([]config.RefSpec, 0)
-	if err = branches.ForEach(func(ref *plumbing.Reference) error {
-		gitlabBranches[ref.Name().Short()] = true
-		refSpecs = append(refSpecs, config.RefSpec(fmt.Sprintf("%[1]s:%[1]s", ref.Name())))
-		return nil
-	}); err != nil {
-		return fmt.Errorf("parsing branches: %v", err)
-	}
-
-	logger.Debug("force-pushing branches to GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl, "count", len(refSpecs))
-	if err = p.repo.PushContext(ctx, &git.PushOptions{
-		RemoteName: "github",
-		Force:      true,
-		RefSpecs:   refSpecs,
-		//Prune:      true, // causes error, attempts to delete main branch
-	}); err != nil {
-		if errors.Is(err, git.NoErrAlreadyUpToDate) {
-			logger.Debug("repository already up-to-date on GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
-		} else {
-			return fmt.Errorf("pushing to github repo: %v", err)
-		}
-	}
-
-	if trimGithubBranches {
-		logger.Debug("determining old branches to trim on GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
-		refSpecsToDelete := make([]config.RefSpec, 0)
-		githubBranches, err := getGithubBranches(ctx, p.githubPath[0], p.githubPath[1])
+	if !onlyMigratePullRequests {
+		logger.Debug("determining branches to push", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
+		branches, err := p.repo.Branches()
 		if err != nil {
-			return fmt.Errorf("listing branches from GitHub: %v", err)
-		}
-		for _, githubBranch := range githubBranches {
-			if githubBranch.Name != nil && !gitlabBranches[*githubBranch.Name] {
-				refSpecsToDelete = append(refSpecsToDelete, config.RefSpec(fmt.Sprintf(":refs/heads/%s", *githubBranch.Name)))
-			}
+			return fmt.Errorf("retrieving branches: %v", err)
 		}
 
-		logger.Debug("trimming old branches on GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl, "count", len(refSpecsToDelete))
+		gitlabBranches := make(map[string]bool, 0)
+		refSpecs := make([]config.RefSpec, 0)
+		if err = branches.ForEach(func(ref *plumbing.Reference) error {
+			gitlabBranches[ref.Name().Short()] = true
+			refSpecs = append(refSpecs, config.RefSpec(fmt.Sprintf("%[1]s:%[1]s", ref.Name())))
+			return nil
+		}); err != nil {
+			return fmt.Errorf("parsing branches: %v", err)
+		}
+
+		logger.Debug("force-pushing branches to GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl, "count", len(refSpecs))
 		if err = p.repo.PushContext(ctx, &git.PushOptions{
 			RemoteName: "github",
 			Force:      true,
-			RefSpecs:   refSpecsToDelete,
+			RefSpecs:   refSpecs,
 			//Prune:      true, // causes error, attempts to delete main branch
 		}); err != nil {
 			if errors.Is(err, git.NoErrAlreadyUpToDate) {
@@ -242,30 +216,58 @@ func (p *project) migrate(ctx context.Context) error {
 				return fmt.Errorf("pushing to github repo: %v", err)
 			}
 		}
-	}
 
-	logger.Debug("force-pushing tags to GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
-	if err = p.repo.PushContext(ctx, &git.PushOptions{
-		RemoteName: "github",
-		Force:      true,
-		RefSpecs:   []config.RefSpec{"refs/tags/*:refs/tags/*"},
-	}); err != nil {
-		if errors.Is(err, git.NoErrAlreadyUpToDate) {
-			logger.Debug("repository already up-to-date on GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
-		} else {
-			return fmt.Errorf("pushing to github repo: %v", err)
+		if trimGithubBranches {
+			logger.Debug("determining old branches to trim on GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
+			refSpecsToDelete := make([]config.RefSpec, 0)
+			githubBranches, err := getGithubBranches(ctx, p.githubPath[0], p.githubPath[1])
+			if err != nil {
+				return fmt.Errorf("listing branches from GitHub: %v", err)
+			}
+			for _, githubBranch := range githubBranches {
+				if githubBranch.Name != nil && !gitlabBranches[*githubBranch.Name] {
+					refSpecsToDelete = append(refSpecsToDelete, config.RefSpec(fmt.Sprintf(":refs/heads/%s", *githubBranch.Name)))
+				}
+			}
+
+			logger.Debug("trimming old branches on GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl, "count", len(refSpecsToDelete))
+			if err = p.repo.PushContext(ctx, &git.PushOptions{
+				RemoteName: "github",
+				Force:      true,
+				RefSpecs:   refSpecsToDelete,
+				//Prune:      true, // causes error, attempts to delete main branch
+			}); err != nil {
+				if errors.Is(err, git.NoErrAlreadyUpToDate) {
+					logger.Debug("repository already up-to-date on GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
+				} else {
+					return fmt.Errorf("pushing to github repo: %v", err)
+				}
+			}
+		}
+
+		logger.Debug("force-pushing tags to GitHub repository", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
+		if err = p.repo.PushContext(ctx, &git.PushOptions{
+			RemoteName: "github",
+			Force:      true,
+			RefSpecs:   []config.RefSpec{"refs/tags/*:refs/tags/*"},
+		}); err != nil {
+			if errors.Is(err, git.NoErrAlreadyUpToDate) {
+				logger.Debug("repository already up-to-date on GitHub", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "url", githubUrl)
+			} else {
+				return fmt.Errorf("pushing to github repo: %v", err)
+			}
+		}
+
+		logger.Debug("setting default repository branch", "owner", p.githubPath[0], "repo", p.githubPath[1], "branch_name", p.defaultBranch)
+		updateRepo = github.Repository{
+			DefaultBranch: &p.defaultBranch,
+		}
+		if _, _, err = gh.Repositories.Edit(ctx, p.githubPath[0], p.githubPath[1], &updateRepo); err != nil {
+			return fmt.Errorf("setting default branch: %v", err)
 		}
 	}
 
-	logger.Debug("setting default repository branch", "owner", p.githubPath[0], "repo", p.githubPath[1], "branch_name", p.defaultBranch)
-	updateRepo = github.Repository{
-		DefaultBranch: &p.defaultBranch,
-	}
-	if _, _, err = gh.Repositories.Edit(ctx, p.githubPath[0], p.githubPath[1], &updateRepo); err != nil {
-		return fmt.Errorf("setting default branch: %v", err)
-	}
-
-	if enablePullRequests {
+	if enablePullRequests || onlyMigratePullRequests {
 		p.migrateMergeRequests(ctx, nil)
 	}
 
