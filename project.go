@@ -1689,15 +1689,14 @@ func (p *project) migrateTextBody(textBody string, mergeRequestIID int) string {
 
 	// Convert markdown image links from /uploads/... to domain/uploads/...
 	// Pattern: ![alt text](/uploads/path/to/file.png)
-	imageLinkRegex := regexp.MustCompile(`!\[([^\]]*)\]\((/uploads/[^)]+)\)`)
+	imageLinkRegex := regexp.MustCompile(`!\[([^\]]*)\]\(/uploads/([^)]+)\)`)
 	textBody = imageLinkRegex.ReplaceAllStringFunc(textBody, func(match string) string {
 		// Extract the alt text and path
 		submatches := imageLinkRegex.FindStringSubmatch(match)
 		if len(submatches) == 3 {
 			altText := submatches[1]
 			uploadPath := submatches[2]
-			// we don't display as image but just a link because the imageHostingDomain is private
-			newLink := fmt.Sprintf("[%s](%s%s)", altText, imageHostingDomain, uploadPath)
+			newLink := fmt.Sprintf("![%s](https://%s/%s/%s/blob/%s/%s)", altText, githubDomain, p.githubPath[0], repoForImages, commitForImages, uploadPath)
 			logger.Debug("converting image link", "merge_request_id", mergeRequestIID, "old", match, "new", newLink)
 			return newLink
 		}

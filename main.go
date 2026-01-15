@@ -24,16 +24,17 @@ import (
 )
 
 const (
-	dateFormat                = time.RFC3339
-	defaultGithubDomain       = "github.com"
-	defaultGitlabDomain       = "gitlab.com"
-	defaultImageHostingDomain = "https://gitlab.com"
+	dateFormat             = time.RFC3339
+	defaultGithubDomain    = "github.com"
+	defaultGitlabDomain    = "gitlab.com"
+	defaultRepoForImages   = "gl-imgs"
+	defaultCommitForImages = "main"
 )
 
 var loop, report bool
 var deleteExistingRepos, enablePullRequests, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches, skipExistingClosedOrMergedMergeRequests, skipMigratingComments, onlyMigratePullRequests, onlyMigrateComments bool
 var githubDomain, githubRepo, githubToken, githubUser, gitlabDomain, gitlabProject, gitlabToken, projectsCsvPath, renameTrunkBranch string
-var imageHostingDomain string
+var repoForImages, commitForImages string
 var mergeRequestsAge int
 var mergeRequestIDFrom int
 
@@ -117,7 +118,8 @@ func main() {
 	flag.IntVar(&mergeRequestsAge, "merge-requests-max-age", 0, "optional maximum age in days of merge requests to migrate")
 	flag.IntVar(&mergeRequestIDFrom, "merge-request-id-from", 0, "optional merge request ID to start migrating from, inclusive")
 	flag.StringVar(&renameTrunkBranch, "rename-trunk-branch", "", "specifies the new trunk branch name (incompatible with -rename-master-to-main)")
-	flag.StringVar(&imageHostingDomain, "image-hosting-domain", defaultImageHostingDomain, "specifies the domain to use for image hosting in future")
+	flag.StringVar(&repoForImages, "repo-for-images", defaultRepoForImages, "specifies the repository to use for GL images")
+	flag.StringVar(&commitForImages, "commit-for-images", defaultCommitForImages, "specifies the commit SHA to use for GL images")
 
 	flag.IntVar(&maxConcurrency, "max-concurrency", 4, "how many projects to migrate in parallel")
 	flag.IntVar(&maxConcurrencyForComments, "max-concurrency-for-comments", 4, "how many merge request comments to migrate in parallel - used only when only-migrate-comments is set")
