@@ -1,4 +1,4 @@
-module github.com/manicminer/gitlab-migrator
+module gitlab-migrator
 
 go 1.23.2
 
