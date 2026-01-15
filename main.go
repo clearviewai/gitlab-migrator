@@ -31,10 +31,11 @@ const (
 )
 
 var loop, report bool
-var deleteExistingRepos, enablePullRequests, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches, skipMigratingComments, onlyMigratePullRequests, onlyMigrateComments bool
+var deleteExistingRepos, enablePullRequests, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches, skipExistingClosedOrMergedMergeRequests, skipMigratingComments, onlyMigratePullRequests, onlyMigrateComments bool
 var githubDomain, githubRepo, githubToken, githubUser, gitlabDomain, gitlabProject, gitlabToken, projectsCsvPath, renameTrunkBranch string
 var imageHostingDomain string
 var mergeRequestsAge int
+var mergeRequestIDFrom int
 
 var (
 	cache                     *objectCache
@@ -91,7 +92,6 @@ func main() {
 	cache = newObjectCache()
 
 	var showVersion bool
-	var mergeRequestsAgeRaw string
 	fmt.Printf(fmt.Sprintf("gitlab-migrator %s\n", version))
 
 	flag.BoolVar(&loop, "loop", false, "continue migrating until canceled")
@@ -102,9 +102,10 @@ func main() {
 	flag.BoolVar(&renameMasterToMain, "rename-master-to-main", false, "rename master branch to main and update pull requests (incompatible with -rename-trunk-branch)")
 	flag.BoolVar(&skipInvalidMergeRequests, "skip-invalid-merge-requests", false, "when true, will log and skip invalid merge requests instead of raising an error")
 	flag.BoolVar(&trimGithubBranches, "trim-branches-on-github", false, "when true, will delete any branches on GitHub that are no longer present in GitLab")
+	flag.BoolVar(&skipExistingClosedOrMergedMergeRequests, "skip-existing-closed-or-merged-merge-requests", false, "when true, will skip migrating closed/merged merge requests that already have a corresponding closed pull request on GitHub")
 	flag.BoolVar(&skipMigratingComments, "skip-migrating-comments", false, "when true, will skip migrating comments - used only when migrate-pull-requests or only-migrate-pull-requests is set, and only-migrate-comments is not set")
-	flag.BoolVar(&onlyMigratePullRequests, "only-migrate-pull-requests", false, "when true, will only migrate pull requests")
-	flag.BoolVar(&onlyMigrateComments, "only-migrate-comments", false, "when true, will only migrate comments")
+	flag.BoolVar(&onlyMigratePullRequests, "only-migrate-pull-requests", false, "when true, will only migrate pull requests - this short-circuits much of the repo migration logic - used only when only-migrate-comments is not set")
+	flag.BoolVar(&onlyMigrateComments, "only-migrate-comments", false, "when true, will only migrate comments - this short-circuits much of the repo/MR migration logic, and uses goroutines for parallelization")
 	flag.BoolVar(&showVersion, "version", false, "output version information")
 
 	flag.StringVar(&githubDomain, "github-domain", defaultGithubDomain, "specifies the GitHub domain to use")
@@ -113,7 +114,8 @@ func main() {
 	flag.StringVar(&gitlabDomain, "gitlab-domain", defaultGitlabDomain, "specifies the GitLab domain to use")
 	flag.StringVar(&gitlabProject, "gitlab-project", "", "the GitLab project to migrate")
 	flag.StringVar(&projectsCsvPath, "projects-csv", "", "specifies the path to a CSV file describing projects to migrate (incompatible with -gitlab-project and -github-repo)")
-	flag.StringVar(&mergeRequestsAgeRaw, "merge-requests-max-age", "", "optional maximum age in days of merge requests to migrate")
+	flag.IntVar(&mergeRequestsAge, "merge-requests-max-age", 0, "optional maximum age in days of merge requests to migrate")
+	flag.IntVar(&mergeRequestIDFrom, "merge-request-id-from", 0, "optional merge request ID to start migrating from, inclusive")
 	flag.StringVar(&renameTrunkBranch, "rename-trunk-branch", "", "specifies the new trunk branch name (incompatible with -rename-master-to-main)")
 	flag.StringVar(&imageHostingDomain, "image-hosting-domain", defaultImageHostingDomain, "specifies the domain to use for image hosting in future")
 
@@ -160,13 +162,6 @@ func main() {
 	if renameMasterToMain && renameTrunkBranch != "" {
 		logger.Error("cannot specify -rename-master-to-main and -rename-trunk-branch together")
 		os.Exit(1)
-	}
-
-	if mergeRequestsAgeRaw != "" {
-		if mergeRequestsAge, err = strconv.Atoi(mergeRequestsAgeRaw); err != nil {
-			logger.Error("must specify an integer for -merge-requests-age")
-			os.Exit(1)
-		}
 	}
 
 	retryClient := &retryablehttp.Client{

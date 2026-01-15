@@ -268,10 +268,53 @@ func (p *project) migrate(ctx context.Context) error {
 	}
 
 	if enablePullRequests || onlyMigratePullRequests {
-		p.migrateMergeRequests(ctx, nil)
+		if mergeRequestIDFrom <= 0 {
+			p.migrateMergeRequests(ctx, nil)
+		} else {
+			latestMergeRequestID, err := p.getLatestMergeRequestID()
+			if err != nil {
+				return fmt.Errorf("retrieving latest merge request ID: %v", err)
+			}
+			if mergeRequestIDFrom > latestMergeRequestID {
+				return fmt.Errorf("merge request ID from is greater than latest merge request ID")
+			}
+			ids := make([]int, latestMergeRequestID-mergeRequestIDFrom+1)
+			for i := range ids {
+				ids[i] = mergeRequestIDFrom + i
+			}
+			p.migrateMergeRequests(ctx, &ids)
+		}
 	}
 
 	return nil
+}
+
+func (p *project) getLatestMergeRequestID() (int, error) {
+	opts := &gitlab.ListProjectMergeRequestsOptions{
+		ListOptions: gitlab.ListOptions{
+			PerPage: 100,
+		},
+		OrderBy: pointer("created_at"),
+		Sort:    pointer("desc"),
+	}
+
+	latestMergeRequestID := 0
+	logger.Info("retrieving latest GitLab merge request", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID)
+
+	result, _, err := gl.MergeRequests.ListProjectMergeRequests(p.project.ID, opts)
+	if err != nil {
+		return 0, fmt.Errorf("retrieving gitlab merge requests: %v", err)
+	}
+
+	// still aggregate in case the first entry is not the latest
+	// the first 100 should be enough to determine for sure
+	for _, mergeRequest := range result {
+		if mergeRequest.IID > latestMergeRequestID {
+			latestMergeRequestID = mergeRequest.IID
+		}
+	}
+
+	return latestMergeRequestID, nil
 }
 
 func (p *project) migrateMergeRequests(ctx context.Context, mergeRequestIDs *[]int) {
@@ -292,7 +335,7 @@ func (p *project) migrateMergeRequests(ctx context.Context, mergeRequestIDs *[]i
 		opts.CreatedAfter = pointer(time.Now().AddDate(0, 0, -mergeRequestsAge))
 	}
 
-	maxMergeRequestNumber := 0
+	latestMergeRequestID := 0
 	logger.Info("retrieving GitLab merge requests", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID)
 	nPages := 0
 	for {
@@ -304,8 +347,8 @@ func (p *project) migrateMergeRequests(ctx context.Context, mergeRequestIDs *[]i
 
 		for _, mergeRequest := range result {
 			mergeRequests[mergeRequest.IID] = mergeRequest
-			if mergeRequest.IID > maxMergeRequestNumber {
-				maxMergeRequestNumber = mergeRequest.IID
+			if mergeRequest.IID > latestMergeRequestID {
+				latestMergeRequestID = mergeRequest.IID
 			}
 		}
 
@@ -319,12 +362,12 @@ func (p *project) migrateMergeRequests(ctx context.Context, mergeRequestIDs *[]i
 	logger.Info("retrieved merge requests", "name", p.gitlabPath[1], "group", p.gitlabPath[0], "project_id", p.project.ID, "count", len(mergeRequests), "n_pages", nPages)
 
 	if mergeRequestIDs == nil {
-		ids := make([]int, maxMergeRequestNumber)
+		ids := make([]int, latestMergeRequestID)
 		for i := range ids {
 			ids[i] = i + 1
 		}
 		mergeRequestIDs = &ids
-		logger.Info(fmt.Sprintf("we will fill in the gaps with empty pull requests from 1 to %d", maxMergeRequestNumber))
+		logger.Info(fmt.Sprintf("we will fill in the gaps with empty pull requests from 1 to %d", latestMergeRequestID))
 	} else {
 		logger.Info("we will fill in missing merge requests with empty pull requests")
 	}
@@ -485,7 +528,7 @@ func (p *project) createEmptyPullRequest(ctx context.Context, mergeRequestIID in
 		}
 	}
 
-	if pullRequest != nil && pullRequest.State != nil && strings.EqualFold(*pullRequest.State, "closed") {
+	if pullRequest != nil && pullRequest.State != nil && strings.EqualFold(*pullRequest.State, "closed") && skipExistingClosedOrMergedMergeRequests {
 		logger.Info("found existing pull request with original merged request both closed/merged. Skipping", "merge_request_id", mergeRequestIID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber())
 		return false, nil
 	}
@@ -670,7 +713,7 @@ func (p *project) migrateMergeRequestWithoutComments(ctx context.Context, mergeR
 	sourceBranchForClosedMergeRequest := fmt.Sprintf("migration-source-%d/%s", mergeRequest.IID, mergeRequest.SourceBranch)
 	targetBranchForClosedMergeRequest := fmt.Sprintf("migration-target-%d/%s", mergeRequest.IID, mergeRequest.TargetBranch)
 
-	if pullRequest != nil && pullRequest.State != nil && strings.EqualFold(*pullRequest.State, "closed") && !strings.EqualFold(mergeRequest.State, "opened") {
+	if pullRequest != nil && pullRequest.State != nil && strings.EqualFold(*pullRequest.State, "closed") && !strings.EqualFold(mergeRequest.State, "opened") && skipExistingClosedOrMergedMergeRequests {
 		logger.Info("found existing pull request with original merged request both closed/merged. Skipping", "merge_request_id", mergeRequest.IID, "owner", p.githubPath[0], "repo", p.githubPath[1], "pr_number", pullRequest.GetNumber())
 		return false, nil
 	}
