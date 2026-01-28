@@ -230,6 +230,27 @@ func downloadImagesFromText(ctx context.Context, cfg Config, projectID int, text
 		cfg.Logger.Debug("downloaded image", "merge_request_id", mergeRequestID, "comment_id", commentID, "path", uploadPath, "url", imageURL)
 	}
 
+	// Pattern: <img src="/uploads/path/to/file.png" .../>
+	htmlImageRegex := regexp.MustCompile(`<img\s+[^>]*src=["'](/uploads/[^"']+)["'][^>]*/?>`)
+	htmlMatches := htmlImageRegex.FindAllStringSubmatch(textBody, -1)
+
+	for _, match := range htmlMatches {
+		if len(match) != 2 {
+			continue
+		}
+		uploadPath := match[1] // /uploads/path/to/file.png
+
+		// Construct full URL
+		imageURL := fmt.Sprintf("https://%s/-/project/%d%s", cfg.ImageHostingDomain, projectID, uploadPath)
+
+		// Download the image
+		if err := downloadImage(ctx, cfg, imageURL, uploadPath, outputDir); err != nil {
+			return fmt.Errorf("downloading image %s: %v", imageURL, err)
+		}
+
+		cfg.Logger.Debug("downloaded image", "merge_request_id", mergeRequestID, "comment_id", commentID, "path", uploadPath, "url", imageURL)
+	}
+
 	return nil
 }
 

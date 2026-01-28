@@ -103,7 +103,8 @@ func main() {
 	flag.BoolVar(&renameMasterToMain, "rename-master-to-main", false, "rename master branch to main and update pull requests (incompatible with -rename-trunk-branch)")
 	flag.BoolVar(&skipInvalidMergeRequests, "skip-invalid-merge-requests", false, "when true, will log and skip invalid merge requests instead of raising an error")
 	flag.BoolVar(&trimGithubBranches, "trim-branches-on-github", false, "when true, will delete any branches on GitHub that are no longer present in GitLab")
-	flag.BoolVar(&skipExistingClosedOrMergedMergeRequests, "skip-existing-closed-or-merged-merge-requests", false, "when true, will skip migrating closed/merged merge requests that already have a corresponding closed pull request on GitHub")
+	flag.BoolVar(&skipExistingClosedOrMergedMergeRequests, "skip-existing-closed-or-merged-merge-requests", false,
+		"when true, will skip migrating closed/merged merge requests that already have corresponding closed pull requests on GitHub - used only when migrate-pull-requests or only-migrate-pull-requests is set, and only-migrate-comments is not set")
 	flag.BoolVar(&skipMigratingComments, "skip-migrating-comments", false, "when true, will skip migrating comments - used only when migrate-pull-requests or only-migrate-pull-requests is set, and only-migrate-comments is not set")
 	flag.BoolVar(&onlyMigratePullRequests, "only-migrate-pull-requests", false, "when true, will only migrate pull requests - this short-circuits much of the repo migration logic - used only when only-migrate-comments is not set")
 	flag.BoolVar(&onlyMigrateComments, "only-migrate-comments", false, "when true, will only migrate comments - this short-circuits much of the repo/MR migration logic, and uses goroutines for parallelization")
@@ -122,7 +123,7 @@ func main() {
 	flag.StringVar(&commitForImages, "commit-for-images", defaultCommitForImages, "specifies the commit SHA to use for GL images")
 
 	flag.IntVar(&maxConcurrency, "max-concurrency", 4, "how many projects to migrate in parallel")
-	flag.IntVar(&maxConcurrencyForComments, "max-concurrency-for-comments", 4, "how many merge request comments to migrate in parallel - used only when only-migrate-comments is set")
+	flag.IntVar(&maxConcurrencyForComments, "max-concurrency-for-comments", 2, "how many merge request comments to migrate in parallel - used only when only-migrate-comments is set")
 
 	flag.Parse()
 
@@ -169,9 +170,9 @@ func main() {
 	retryClient := &retryablehttp.Client{
 		HTTPClient:   cleanhttp.DefaultPooledClient(),
 		Logger:       nil,
-		RetryMax:     50,
-		RetryWaitMin: 5 * time.Second,
-		RetryWaitMax: 300 * time.Second,
+		RetryMax:     100,
+		RetryWaitMin: 1 * time.Second,
+		RetryWaitMax: 10 * time.Second,
 	}
 
 	retryClient.Backoff = func(min, max time.Duration, attemptNum int, resp *http.Response) (sleep time.Duration) {
@@ -194,10 +195,11 @@ func main() {
 		}()
 
 		if resp != nil {
-			// Check the Retry-After header
+			// Check the Retry-After header first (highest priority)
 			if s, ok := resp.Header["Retry-After"]; ok && len(s) > 0 {
 				if retryAfter, err := strconv.ParseInt(s[0], 10, 64); err == nil {
 					sleep = time.Second * time.Duration(retryAfter)
+					logger.Warn("waiting before retrying failed API request due to Retry-After header", "method", requestMethod, "url", requestUrl, "status", statusCode, "sleep", sleep, "attempt", attemptNum, "max_attempts", retryClient.RetryMax)
 					return
 				}
 			}
@@ -205,26 +207,28 @@ func main() {
 			// Reference:
 			// - https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api?apiVersion=2022-11-28
 			// - https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api?apiVersion=2022-11-28
+			// Always check X-Ratelimit-Reset if present, regardless of remaining count.
+			// This allows us to exit exponential backoff when we get a response with rate limit info.
+			if w, ok := resp.Header["X-Ratelimit-Reset"]; ok && len(w) > 0 {
+				if recoveryEpoch, err := strconv.ParseInt(w[0], 10, 64); err == nil {
+					// Add 10 seconds to recovery timestamp for clock differences
+					calculatedSleep := roundDuration(time.Until(time.Unix(recoveryEpoch+10, 0)), time.Second)
+					// Ensure we don't sleep for negative durations (clock skew or already passed)
+					if calculatedSleep > 0 {
+						sleep = calculatedSleep
+						logger.Warn("waiting before retrying failed API request due to X-Ratelimit-Reset header", "method", requestMethod, "url", requestUrl, "status", statusCode, "sleep", sleep, "attempt", attemptNum, "max_attempts", retryClient.RetryMax)
+						return
+					}
+				}
+			}
+
+			// Check X-Ratelimit-Remaining for additional context
 			if v, ok := resp.Header["X-Ratelimit-Remaining"]; ok && len(v) > 0 {
 				if remaining, err := strconv.ParseInt(v[0], 10, 64); err == nil && remaining == 0 {
-
-					// If x-ratelimit-reset is present, this indicates the UTC timestamp when we can retry
-					if w, ok := resp.Header["X-Ratelimit-Reset"]; ok && len(w) > 0 {
-						if recoveryEpoch, err := strconv.ParseInt(w[0], 10, 64); err == nil {
-							// Add 30 seconds to recovery timestamp for clock differences
-							calculatedSleep := roundDuration(time.Until(time.Unix(recoveryEpoch+30, 0)), time.Second)
-							// Ensure we don't sleep for negative durations (clock skew or already passed)
-							if calculatedSleep > 0 {
-								sleep = calculatedSleep
-							} else {
-								sleep = min
-							}
-							return
-						}
-					}
-
-					// Otherwise, wait for 60 seconds
-					sleep = 60 * time.Second
+					// If we get here, X-Ratelimit-Reset was missing/invalid but remaining == 0
+					// Fallback: wait for the minimum sleep duration
+					sleep = min
+					logger.Warn("waiting before retrying failed API request due to X-Ratelimit-Remaining header (fallback - X-Ratelimit-Reset missing)", "method", requestMethod, "url", requestUrl, "status", statusCode, "sleep", sleep, "attempt", attemptNum, "max_attempts", retryClient.RetryMax)
 					return
 				}
 			}
@@ -238,6 +242,7 @@ func main() {
 		}
 
 		sleep = wait
+		logger.Warn("waiting before retrying failed API request due to exponential backoff", "method", requestMethod, "url", requestUrl, "status", statusCode, "sleep", sleep, "attempt", attemptNum, "max_attempts", retryClient.RetryMax)
 		return
 	}
 
