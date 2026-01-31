@@ -27,16 +27,16 @@ const (
 	dateFormat             = time.RFC3339
 	defaultGithubDomain    = "github.com"
 	defaultGitlabDomain    = "gitlab.com"
-	defaultRepoForImages   = "gl-imgs"
-	defaultCommitForImages = "main"
+	defaultImagesRepoName = "gl-imgs"
+	defaultImagesRepoRef  = "main"
 )
 
 var loop, report bool
 var deleteExistingRepos, enablePullRequests, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches, skipExistingClosedOrMergedMergeRequests, skipMigratingComments, onlyMigratePullRequests, onlyMigrateComments bool
 var githubDomain, githubRepo, githubToken, githubUser, gitlabDomain, gitlabProject, gitlabToken, projectsCsvPath, renameTrunkBranch string
-var repoForImages, commitForImages string
+var imagesRepoName, imagesRepoRef string
 var mergeRequestsAge int
-var mergeRequestIDFrom int
+var mergeRequestsFromID int
 
 var (
 	cache                     *objectCache
@@ -117,10 +117,10 @@ func main() {
 	flag.StringVar(&gitlabProject, "gitlab-project", "", "the GitLab project to migrate")
 	flag.StringVar(&projectsCsvPath, "projects-csv", "", "specifies the path to a CSV file describing projects to migrate (incompatible with -gitlab-project and -github-repo)")
 	flag.IntVar(&mergeRequestsAge, "merge-requests-max-age", 0, "optional maximum age in days of merge requests to migrate")
-	flag.IntVar(&mergeRequestIDFrom, "merge-request-id-from", 0, "optional merge request ID to start migrating from, inclusive")
+	flag.IntVar(&mergeRequestsFromID, "merge-requests-from-id", 0, "optional merge request ID to start migrating from, inclusive")
 	flag.StringVar(&renameTrunkBranch, "rename-trunk-branch", "", "specifies the new trunk branch name (incompatible with -rename-master-to-main)")
-	flag.StringVar(&repoForImages, "repo-for-images", defaultRepoForImages, "specifies the repository to use for GL images")
-	flag.StringVar(&commitForImages, "commit-for-images", defaultCommitForImages, "specifies the commit SHA to use for GL images")
+	flag.StringVar(&imagesRepoName, "images-repo-name", defaultImagesRepoName, "specifies the repository to use for GL images")
+	flag.StringVar(&imagesRepoRef, "images-repo-ref", defaultImagesRepoRef, "specifies the commit SHA to use for GL images")
 
 	flag.IntVar(&maxConcurrency, "max-concurrency", 4, "how many projects to migrate in parallel")
 	flag.IntVar(&maxConcurrencyForComments, "max-concurrency-for-comments", 2, "how many merge request comments to migrate in parallel - used only when only-migrate-comments is set")

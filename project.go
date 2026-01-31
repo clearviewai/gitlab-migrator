@@ -304,8 +304,8 @@ func (p *project) migrateMergeRequests(ctx context.Context, mergeRequestIDs *[]i
 		opts.CreatedAfter = pointer(time.Now().AddDate(0, 0, -mergeRequestsAge))
 	}
 
-	if mergeRequestIDFrom > 0 {
-		mergeRequestFrom, err := p.getMergeRequestByID(mergeRequestIDFrom)
+	if mergeRequestsFromID > 0 {
+		mergeRequestFrom, err := p.getMergeRequestByID(mergeRequestsFromID)
 		if err != nil {
 			sendErr(fmt.Errorf("retrieving gitlab merge request: %v", err))
 			return
@@ -1701,7 +1701,7 @@ func (p *project) migrateTextBody(textBody string, mergeRequestIID int) string {
 		if len(submatches) == 3 {
 			altText := submatches[1]
 			uploadPath := submatches[2]
-			newLink := fmt.Sprintf("[🖼️ %s](https://%s/%s/%s/blob/%s/%s)", altText, githubDomain, p.githubPath[0], repoForImages, commitForImages, uploadPath)
+			newLink := fmt.Sprintf("[🖼️ %s](https://%s/%s/%s/blob/%s/%s)", altText, githubDomain, p.githubPath[0], imagesRepoName, imagesRepoRef, uploadPath)
 			logger.Debug("converting image link", "merge_request_id", mergeRequestIID, "old", match, "new", newLink)
 			return newLink
 		}
@@ -1723,7 +1723,7 @@ func (p *project) migrateTextBody(textBody string, mergeRequestIID int) string {
 			if len(altMatches) == 2 {
 				altText = altMatches[1]
 			}
-			newLink := fmt.Sprintf("[🖼️ %s](https://%s/%s/%s/blob/%s/%s)", altText, githubDomain, p.githubPath[0], repoForImages, commitForImages, uploadPath)
+			newLink := fmt.Sprintf("[🖼️ %s](https://%s/%s/%s/blob/%s/%s)", altText, githubDomain, p.githubPath[0], imagesRepoName, imagesRepoRef, uploadPath)
 			logger.Debug("converting HTML image tag", "merge_request_id", mergeRequestIID, "old", match, "new", newLink)
 			return newLink
 		}
